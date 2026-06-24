@@ -14,25 +14,7 @@ let mockError: string | null = null;
 let mockPublicKey: string | null = null;
 
 jest.mock('@/context/WalletContext', () => ({
-  useWalletContext: () => ({
-    status: mockStatus,
-    connect: mockConnect,
-    isConnecting: mockIsConnecting,
-    isConnected: mockStatus === 'CONNECTED',
-    isWrongNetwork: false,
-    error: mockError,
-    publicKey: mockPublicKey,
-    refresh: mockRefresh,
-    walletType: null,
-    networkPassphrase: null,
-    isInstalled: false,
-    disconnect: jest.fn(),
-    connectFreighter: mockConnect,
-    connectLobstr: jest.fn(),
-    freighter: { isInstalled: false, isConnecting: false, isConnected: false, isWrongNetwork: false, error: null },
-    lobstr: { isInstalled: false, isConnecting: false, isConnected: false, isWrongNetwork: false, error: null },
-    magic: { isConnecting: false, isConnected: false, error: null, publicAddress: null, logout: jest.fn() },
-  }),
+  useWalletContext: jest.fn(),
 }));
 
 jest.mock('@/components/MagicWalletModal', () => ({
@@ -66,6 +48,26 @@ describe('ConnectWalletModal', () => {
     mockIsConnecting = false;
     mockError = null;
     mockPublicKey = null;
+    const { useWalletContext } = jest.requireMock('@/context/WalletContext');
+    (useWalletContext as jest.Mock).mockImplementation(() => ({
+      status: mockStatus,
+      connect: mockConnect,
+      isConnecting: mockIsConnecting,
+      isConnected: mockStatus === 'CONNECTED',
+      isWrongNetwork: false,
+      error: mockError,
+      publicKey: mockPublicKey,
+      refresh: mockRefresh,
+      walletType: null,
+      networkPassphrase: null,
+      isInstalled: false,
+      disconnect: jest.fn(),
+      connectFreighter: mockConnect,
+      connectLobstr: jest.fn(),
+      freighter: { isInstalled: false, isConnecting: false, isConnected: false, isWrongNetwork: false, error: null },
+      lobstr: { isInstalled: false, isConnecting: false, isConnected: false, isWrongNetwork: false, error: null },
+      magic: { isConnecting: false, isConnected: false, error: mockError, publicAddress: null, logout: jest.fn() },
+    }));
   });
 
   it('renders nothing when isOpen is false', () => {

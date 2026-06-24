@@ -33,6 +33,7 @@ jest.mock('@/lib/contract', () => ({
 
 jest.mock('@/lib/indexer', () => ({
   fetchListings: jest.fn().mockResolvedValue({ listings: [], total: 0 }),
+  fetchArtistListings: jest.fn().mockResolvedValue([]),
 }));
 
 jest.mock('@/lib/config', () => ({
