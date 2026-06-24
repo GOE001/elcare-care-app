@@ -1,25 +1,24 @@
 ﻿// -------------------------------------------------------------
 // lib/lobstr.ts — Lobstr browser wallet helpers
 // Uses @lobstrco/signer-extension-api (mirrors Freighter's API shape)
+// Dynamic imports used to prevent SSR crashes in Next.js
 // -------------------------------------------------------------
-
-import {
-  isConnected,
-  getPublicKey,
-  signTransaction,
-  isAllowed,
-  setAllowed,
-} from "@lobstrco/signer-extension-api";
 
 export interface LobstrAccount {
   publicKey: string;
+}
+
+async function getLobstrApi() {
+  return import("@lobstrco/signer-extension-api");
 }
 
 /**
  * Returns true if the Lobstr Signer extension is installed.
  */
 export async function isLobstrInstalled(): Promise<boolean> {
+  if (typeof window === "undefined") return false;
   try {
+    const { isConnected } = await getLobstrApi();
     const result = await isConnected();
     if (typeof result === "boolean") return result;
     if (result && typeof (result as any).isConnected === "boolean") {
@@ -35,6 +34,7 @@ export async function isLobstrInstalled(): Promise<boolean> {
  * Requests access to Lobstr and returns the public key.
  */
 export async function connectLobstr(): Promise<LobstrAccount> {
+  const { setAllowed, getPublicKey } = await getLobstrApi();
   const allowed = await setAllowed();
   const isAllowedResult =
     typeof allowed === "boolean" ? allowed : (allowed as any)?.isAllowed;
@@ -60,6 +60,7 @@ export async function signWithLobstr(
   txXdr: string,
   networkPassphrase: string
 ): Promise<string> {
+  const { signTransaction } = await getLobstrApi();
   const result = await signTransaction(txXdr, { networkPassphrase });
   if (typeof result === "string") return result;
   if (result && (result as any).signedTxXdr) return (result as any).signedTxXdr;
@@ -74,6 +75,7 @@ export async function getLobstrPublicKey(): Promise<string | null> {
   try {
     const installed = await isLobstrInstalled();
     if (!installed) return null;
+    const { getPublicKey } = await getLobstrApi();
     const result = await getPublicKey();
     if (typeof result === "string") return result;
     if (result && (result as any).publicKey) return (result as any).publicKey;
