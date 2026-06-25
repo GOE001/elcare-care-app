@@ -1,5 +1,5 @@
 // storage.rs
-use crate::types::{Auction, Listing, Offer};
+use crate::types::{Auction, BidRecord, Listing, Offer};
 use soroban_sdk::{contracttype, Address, Env, Vec};
 
 #[contracttype]
@@ -31,18 +31,8 @@ pub enum DataKey {
     /// Global extension trigger threshold in seconds (anti-sniping: fires when
     /// `end_time - now < threshold` at bid time).
     AuctionExtensionTrigger,
-    /// Global minimum listing/auction price (in payment-token stroops).
-    /// When set, any price below this value is rejected with `PriceOutOfBounds`.
-    /// When absent, no lower bound is enforced (permissive default).
-    MinPrice,
-    /// Global maximum listing/auction price (in payment-token stroops).
-    /// When set, any price above this value is rejected with `PriceOutOfBounds`.
-    /// When absent, no upper bound is enforced (permissive default).
-    MaxPrice,
-    /// Migration marker for a specific version string.  Stored as a `bool=true`
-    /// once the `migrate` entry point has been successfully executed for that
-    /// version.  Keyed by the version string to keep migrations idempotent.
-    MigrationDone(soroban_sdk::String),
+    /// Bounded bid history for a specific auction (capped to BID_HISTORY_CAP entries).
+    AuctionBids(u64),
 }
 
 pub const LEDGER_TTL_BUMP: u32 = 432_000;
@@ -467,7 +457,50 @@ pub fn clear_pending_admin_storage(env: &Env) {
     env.storage().persistent().remove(&DataKey::PendingAdmin);
 }
 
-// ── Pause/Unpause Mechanism ──────────────────────────────────
+// ── Auction bid history ──────────────────────────────────────
+
+/// Append `record` to the bounded bid history for `auction_id`.
+///
+/// The history vector is capped to `cap` entries.  When the vector is already
+/// at capacity the oldest entry (index 0) is evicted before the new one is
+/// pushed, so the vector always holds the most recent <= N bids in
+/// chronological (oldest-to-newest) order.
+pub fn append_bid_record(env: &Env, auction_id: u64, record: &BidRecord, cap: u32) {
+    let key = DataKey::AuctionBids(auction_id);
+    let mut history = env
+        .storage()
+        .persistent()
+        .get::<DataKey, soroban_sdk::Vec<BidRecord>>(&key)
+        .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+
+    // Evict the oldest entry when the history is already full.
+    if history.len() >= cap {
+        let mut trimmed = soroban_sdk::Vec::new(env);
+        for i in 1..history.len() {
+            trimmed.push_back(history.get(i).unwrap());
+        }
+        history = trimmed;
+    }
+
+    history.push_back(record.clone());
+    env.storage().persistent().set(&key, &history);
+    bump_entry_ttl(env, &key);
+}
+
+/// Load the bounded bid history for `auction_id`.  Returns an empty vector if
+/// no bids have been placed yet or the key has been evicted.
+pub fn load_auction_bids(env: &Env, auction_id: u64) -> soroban_sdk::Vec<BidRecord> {
+    let key = DataKey::AuctionBids(auction_id);
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, soroban_sdk::Vec<BidRecord>>(&key)
+        .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+    if !value.is_empty() {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
 
 pub fn set_paused(env: &Env, paused: bool) {
     env.storage().persistent().set(&DataKey::IsPaused, &paused);

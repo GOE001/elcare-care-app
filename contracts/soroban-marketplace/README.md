@@ -60,11 +60,12 @@ This contract manages the complete lifecycle of on-chain marketplace listings, a
 
 | Function | Auth | Description |
 |----------|------|-------------|
-| `create_auction(creator, collection, token_id, reserve_price, token, end_time, recipients)` | creator | Creates an auction |
-| `place_bid(bidder, auction_id, bid_amount)` | bidder | Places a bid above the current highest |
-| `finalize_auction(auction_id)` | anyone | Finalizes after `end_time` — transfers NFT to winner |
-| `cancel_auction(creator, auction_id)` | creator | Cancels with no bids |
-| `get_auction(auction_id)` | — | Returns full `Auction` struct |
+| `create_auction(creator, token, collection, token_id, reserve_price, duration, recipients)` | creator | Creates an auction. `duration` must be ≥ `MIN_AUCTION_DURATION` (3 600 s / 1 hour); rejects with `InvalidAuctionDuration` otherwise. |
+| `place_bid(bidder, auction_id, bid_amount)` | bidder | Places a bid above the current highest. Appends a `BidRecord` to the bounded on-chain history (capped to `BID_HISTORY_CAP = 20`). |
+| `finalize_auction(caller, auction_id)` | anyone | Finalizes after `end_time` — transfers NFT to winner and distributes funds. |
+| `cancel_auction(creator, auction_id)` | creator | Cancels a no-bid auction before it ends. |
+| `get_auction(auction_id)` | — | Returns full `Auction` struct. |
+| `get_auction_bids(auction_id)` | — | Returns the bounded bid history (`Vec<BidRecord>`) in chronological order (oldest → newest). At most `BID_HISTORY_CAP` (20) entries are retained; older bids are evicted. Returns an empty vec when no bids have been placed. |
 
 ### Offers
 
@@ -261,38 +262,48 @@ pub struct Auction {
 }
 
 pub enum AuctionStatus { Active, Finalized, Cancelled }
+
+/// A single entry in the per-auction bounded bid history.
+pub struct BidRecord {
+    pub bidder: Address,   // Account that placed this bid
+    pub amount: i128,      // Bid amount in payment-token stroops
+    pub ledger: u32,       // Ledger sequence number when the bid was recorded
+}
 ```
+
+### Constants
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `MIN_AUCTION_DURATION` | `3_600` seconds (1 hour) | Minimum `duration` accepted by `create_auction`. Auctions shorter than this are rejected with `InvalidAuctionDuration (#31)` to prevent meaningless or front-runnable auctions. |
+| `BID_HISTORY_CAP` | `20` entries | Maximum number of `BidRecord` entries retained per auction on-chain. When a new bid is placed and the history is already full, the oldest entry is evicted. Use the off-chain indexer for full bid history beyond this cap. |
 
 ---
 
 ## Storage Layout
 
 ```
-Persistent key                               Value
-──────────────────────────────────────────────────────────────────────
-DataKey::ListingCount                        u64
-DataKey::Listing(listing_id: u64)            Listing
-DataKey::ArtistListings(Address)             Vec<u64>
-DataKey::AuctionCount                        u64
-DataKey::Auction(auction_id: u64)            Auction
-DataKey::OfferCount                          u64
-DataKey::Offer(offer_id: u64)               Offer
-DataKey::Admin                               Address
-DataKey::PendingAdmin                        Address
-DataKey::Treasury                            Address
-DataKey::ProtocolFeeBps                      u32
-DataKey::MinBidIncrement                     i128
-DataKey::AuctionExtensionWindow              u64
-DataKey::AuctionExtensionTrigger             u64
-DataKey::IsPaused                            bool
-DataKey::TokenWhitelist                      Vec<Address>
-DataKey::RevokedArtist(Address)              bool
-DataKey::ActiveListings                      Vec<u64>
-DataKey::ListingOffers(listing_id: u64)      Vec<u64>
-DataKey::OffererOffers(Address)              Vec<u64>
-DataKey::MinPrice                            i128       ← NEW (price bounds)
-DataKey::MaxPrice                            i128       ← NEW (price bounds)
-DataKey::MigrationDone(version: String)      bool       ← NEW (versioning)
+Persistent key                           Value
+──────────────────────────────────────────────────────────────
+DataKey::ListingCount                    u64
+DataKey::Listing(listing_id: u64)        Listing
+DataKey::ArtistListings(Address)         Vec<u64>
+DataKey::AuctionCount                    u64
+DataKey::Auction(auction_id: u64)        Auction
+DataKey::AuctionBids(auction_id: u64)    Vec<BidRecord>  (capped to BID_HISTORY_CAP=20)
+DataKey::OfferCount                      u64
+DataKey::Offer(offer_id: u64)            Offer
+DataKey::Admin                           Address
+DataKey::PendingAdmin                    Address
+DataKey::Treasury                        Address
+DataKey::ProtocolFeeBps                  u32
+DataKey::MinBidIncrement                 i128
+DataKey::AuctionExtensionWindow          u64
+DataKey::AuctionExtensionTrigger         u64
+DataKey::IsPaused                        bool
+DataKey::TokenWhitelist                  Vec<Address>
+DataKey::RevokedArtist(Address)          bool
+DataKey::ActiveListings                  Vec<u64>
 ```
 
 All persistent entries use `extend_ttl` on every read/write (~30-day TTL via `LEDGER_TTL_THRESHOLD = 144_000`, `LEDGER_TTL_BUMP = 432_000`).
@@ -301,39 +312,40 @@ All persistent entries use `extend_ttl` on every read/write (~30-day TTL via `LE
 
 ## Error Codes
 
-| Code | Variant | Meaning |
-|------|---------|---------|
-| 1 | `InvalidCid` | Legacy — empty metadata CID (V1 flow, unused) |
-| 2 | `InvalidPrice` | Price ≤ 0, or `set_price_bounds` min > max |
-| 3 | `ListingNotFound` | Listing ID does not exist |
-| 4 | `ListingNotActive` | Listing is Sold or Cancelled |
-| 5 | `Unauthorized` | Caller does not have required auth |
-| 6 | `CannotBuyOwnListing` | Artist cannot buy their own listing |
-| 7 | `InvalidSplit` | Empty recipient array |
-| 8 | `TooManyRecipients` | More than 4 recipients |
-| 9 | `AuctionNotFound` | Auction ID does not exist |
-| 10 | `AuctionNotActive` | Auction is Finalized or Cancelled |
-| 11 | `BidTooLow` | Bid below reserve or minimum increment |
-| 12 | `AuctionExpired` | Bid placed after auction end time |
-| 13 | `AuctionNotExpired` | Unused |
-| 14 | `AuctionAlreadyFinalized` | Auction already settled |
-| 15 | `ArtistRevoked` | Artist is not permitted to list |
-| 16 | `OfferNotFound` | Offer ID does not exist |
-| 17 | `CannotOfferOwnListing` | Offerer is the listing owner |
-| 18 | `OfferNotPending` | Offer is not in Pending state |
-| 19 | `InsufficientOfferAmount` | Offer amount ≤ 0 |
-| 20 | `ListingSold` | Listing has already been sold |
-| 21 | `ListingCancelled` | Listing has been cancelled |
-| 22 | `ReentrancyGuard` | Reentrancy lock already held |
-| 23 | `ContractPaused` | Contract is paused by admin |
-| 24 | `InvalidRoyalty` | Unused (superseded by RoyaltyExceedsLimit) |
-| 25 | `TokenNotWhitelisted` | Payment token not on whitelist at purchase time |
-| 26 | `RoyaltyExceedsLimit` | Sum of recipient bps + fee exceeds 10 000 |
-| 27 | `ListingExpired` | Listing has passed its `expires_at` timestamp |
-| 28 | `ListingNotExpired` | `expire_listing` called before expiry |
-| 29 | `AlreadyMigrated` | `migrate` called for a version already applied ← NEW |
-| 30 | `PriceOutOfBounds` | Price outside admin-set `[min_price, max_price]` ← NEW |
-| 31 | `AuctionHasBids` | `cancel_auction` blocked because bids exist ← NEW |
+| Code | Value | Meaning |
+|------|-------|---------|
+| `InvalidCid` | 1 | Listing CID validation failure (legacy) |
+| `InvalidPrice` | 2 | Price / fee amount is invalid (≤ 0 or > limit) |
+| `ListingNotFound` | 3 | Listing ID does not exist |
+| `ListingNotActive` | 4 | Listing is Sold or Cancelled |
+| `Unauthorized` | 5 | Caller does not have required auth |
+| `CannotBuyOwnListing` | 6 | Artist cannot purchase their own listing |
+| `InvalidSplit` | 7 | Recipient array is empty |
+| `TooManyRecipients` | 8 | More than 4 recipients provided |
+| `AuctionNotFound` | 9 | Auction ID does not exist |
+| `AuctionNotActive` | 10 | Auction is already finalized or cancelled |
+| `BidTooLow` | 11 | Bid below reserve price or min-increment threshold |
+| `AuctionExpired` | 12 | Bid placed after `end_time` |
+| `AuctionNotExpired` | 13 | (reserved) |
+| `AuctionAlreadyFinalized` | 14 | Auction already settled; cannot finalize or cancel again |
+| `ArtistRevoked` | 15 | Revoked artist attempted a creation action |
+| `OfferNotFound` | 16 | Offer ID does not exist |
+| `CannotOfferOwnListing` | 17 | Artist cannot make an offer on their own listing |
+| `OfferNotPending` | 18 | Offer is not in Pending state |
+| `InsufficientOfferAmount` | 19 | Offer amount ≤ 0 |
+| `ListingSold` | 20 | Listing is already sold |
+| `ListingCancelled` | 21 | Listing is already cancelled |
+| `ReentrancyGuard` | 22 | Re-entrant call detected on the same listing/auction |
+| `ContractPaused` | 23 | Contract is paused by admin |
+| `InvalidRoyalty` | 24 | Royalty bps > 10 000 |
+| `TokenNotWhitelisted` | 25 | Payment token removed from whitelist since listing creation |
+| `RoyaltyExceedsLimit` | 26 | Sum of recipient bps + protocol fee > 10 000 |
+| `ListingExpired` | 27 | Listing `expires_at` has passed |
+| `ListingNotExpired` | 28 | `expire_listing` called before the expiry timestamp |
+| `AuctionNotEnded` | 28 | `finalize_auction` called before `end_time` |
+| `AuctionHasBids` | 30 | `cancel_auction` called on an auction with an active highest bidder |
+| `InvalidAuctionDuration` | 31 | `create_auction` `duration` < `MIN_AUCTION_DURATION` (3 600 s) |
+| `SelfBidNotAllowed` | 32 | `place_bid` called by the auction creator (shill-bid prevention) |
 
 ---
 

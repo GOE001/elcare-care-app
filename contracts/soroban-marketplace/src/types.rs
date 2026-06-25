@@ -42,17 +42,18 @@ pub enum MarketplaceError {
     /// `expire_listing` was called on a listing whose `expires_at` is still in
     /// the future (or the listing has no expiry).
     ListingNotExpired = 28,
-    /// `migrate` was called but the migration marker for the current version is
-    /// already recorded — the migration has already been applied and the call
-    /// is a no-op (idempotent guard).
-    AlreadyMigrated = 29,
-    /// A listing or auction price falls outside the admin-configured
-    /// [min_price, max_price] bounds.  Either the price is below `min_price`
-    /// or above `max_price`.  Unset bounds are treated permissively (no limit).
-    PriceOutOfBounds = 30,
-    /// Caller of `cancel_auction` attempted to cancel an auction that already
-    /// has at least one bid.  Cancellation is blocked to protect escrowed funds.
-    AuctionHasBids = 31,
+    /// `finalize_auction` was called before `end_time` has passed.
+    AuctionNotEnded = 29,
+    /// `cancel_auction` was called on an auction that already has at least one
+    /// bid — cancelling would strand the bidder's escrowed funds.
+    AuctionHasBids = 30,
+    /// `create_auction` was called with an `end_time` (or `duration`) that is in
+    /// the past or shorter than `MIN_AUCTION_DURATION`.
+    InvalidAuctionDuration = 31,
+    /// `place_bid` was called by the auction creator — self-bidding (shill
+    /// bidding) is not allowed.  The bidder address must differ from the
+    /// auction's `creator` field.
+    SelfBidNotAllowed = 32,
 }
 
 #[contracttype]
@@ -150,6 +151,22 @@ pub struct Auction {
     /// auction is created, giving bidders and the creator certainty about the
     /// net payout — consistent with how listings behave.
     pub protocol_fee_bps: u32,
+}
+
+/// A single entry in the per-auction bounded bid history.
+///
+/// The history is capped to `BID_HISTORY_CAP` entries (see `contract.rs`).
+/// When the cap is reached the oldest entry is evicted so only the most
+/// recent N bids are ever persisted.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BidRecord {
+    /// The account that placed this bid.
+    pub bidder: Address,
+    /// The bid amount (in the auction's payment token stroops).
+    pub amount: i128,
+    /// The ledger sequence number at which this bid was recorded.
+    pub ledger: u32,
 }
 
 #[contracttype]

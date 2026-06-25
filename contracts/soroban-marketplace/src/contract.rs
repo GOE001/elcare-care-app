@@ -13,10 +13,11 @@ use crate::events::*;
 use crate::{
     storage::{
         acquire_auction_lock, acquire_listing_lock, add_artist_auction_id, add_artist_listing_id,
-        add_to_active_listings, clear_pending_admin_storage, get_active_listing_ids,
-        get_artist_auction_ids, get_artist_listing_ids, get_auction_count, get_listing_count,
-        get_pending_admin_storage, increment_auction_count, increment_listing_count,
-        increment_offer_count, is_artist_revoked_storage, load_auction, load_listing,
+        add_to_active_listings, append_bid_record, clear_pending_admin_storage,
+        get_active_listing_ids, get_artist_auction_ids, get_artist_listing_ids,
+        get_auction_count, get_listing_count, get_pending_admin_storage,
+        increment_auction_count, increment_listing_count, increment_offer_count,
+        is_artist_revoked_storage, load_auction, load_auction_bids, load_listing,
         load_listing_offers, load_offer, load_offerer_offers, release_auction_lock,
         release_listing_lock, remove_artist_revocation_storage, remove_from_active_listings,
         save_auction, save_listing, save_listing_offers, save_offer, save_offerer_offers,
@@ -28,8 +29,8 @@ use crate::{
         is_migration_done, set_migration_done,
     },
     types::{
-        Auction, AuctionStatus, CancelReason, Listing, ListingStatus, MarketplaceError, Offer,
-        OfferStatus, Recipient,
+        Auction, AuctionStatus, BidRecord, CancelReason, Listing, ListingStatus,
+        MarketplaceError, Offer, OfferStatus, Recipient,
     },
 };
 
@@ -46,18 +47,21 @@ const DEFAULT_EXTENSION_WINDOW: u64 = 600;
 /// triggers the extension. Set to 0 to disable the feature by default.
 const DEFAULT_EXTENSION_TRIGGER: u64 = 0;
 
-/// Current semantic version of this contract.  Bump this string whenever a
-/// storage-shape change is introduced so that the `migrate` entry point can
-/// distinguish between already-applied and pending migrations.
+/// Minimum auction duration in seconds (1 hour).
 ///
-/// Versioning policy
-/// -----------------
-/// * MAJOR (x.0.0): backward-incompatible storage layout changes that require
-///   all on-chain data to be re-encoded or dropped.
-/// * MINOR (1.x.0): new optional storage keys added; old clients can still read
-///   the existing keys without modification.
-/// * PATCH (1.0.x): bug fixes and documentation corrections; no storage changes.
-pub const CONTRACT_VERSION: &str = "1.0.0";
+/// An auction whose computed `end_time = now + duration` would be less than
+/// `MIN_AUCTION_DURATION` seconds in the future is rejected with
+/// `InvalidAuctionDuration`.  This prevents meaningless or front-runnable
+/// auctions that expire almost immediately.
+const MIN_AUCTION_DURATION: u64 = 3_600; // 1 hour
+
+/// Maximum number of bid records retained per auction in the on-chain history.
+///
+/// When a new bid is placed and the history already holds `BID_HISTORY_CAP`
+/// entries, the oldest entry is evicted so storage growth is strictly bounded.
+/// Exposed via `get_auction_bids` for contract-side verification and frontend
+/// fallback.
+const BID_HISTORY_CAP: u32 = 20;
 
 #[contract]
 pub struct MarketplaceContract;
@@ -895,8 +899,12 @@ impl MarketplaceContract {
         if reserve_price <= 0 {
             panic_with_error!(&env, MarketplaceError::InvalidPrice);
         }
-        // Enforce admin-configured global price bounds when set.
-        Self::require_price_in_bounds(&env, reserve_price);
+        // Enforce a minimum auction duration so auctions that would expire
+        // nearly immediately (or in the past) are rejected up front.
+        // MIN_AUCTION_DURATION is documented in the constant declaration above.
+        if duration < MIN_AUCTION_DURATION {
+            panic_with_error!(&env, MarketplaceError::InvalidAuctionDuration);
+        }
         if !Self::is_token_whitelisted(&env, &token) {
             panic_with_error!(&env, MarketplaceError::Unauthorized);
         }
@@ -961,6 +969,12 @@ impl MarketplaceContract {
         if env.ledger().timestamp() >= auction.end_time {
             panic_with_error!(&env, MarketplaceError::AuctionExpired);
         }
+        // Block shill bidding: the auction creator must not be able to bid on
+        // their own auction.  This prevents artificial price inflation and
+        // protects legitimate bidders from being outbid by the seller.
+        if bidder == auction.creator {
+            panic_with_error!(&env, MarketplaceError::SelfBidNotAllowed);
+        }
         // Enforce the minimum acceptable bid on-chain:
         //   • first bid (no prior bidder): must be at least `reserve_price`.
         //   • subsequent bids: must exceed the current highest bid by at least
@@ -1005,6 +1019,21 @@ impl MarketplaceContract {
         }
 
         save_auction(&env, &auction);
+
+        // ── Record bid in bounded history ────────────────────────────────────
+        // The history is capped to BID_HISTORY_CAP entries; the oldest is
+        // evicted when the cap is reached.  Chronological (oldest-to-newest)
+        // order is preserved, so index 0 is always the earliest retained bid.
+        append_bid_record(
+            &env,
+            auction_id,
+            &BidRecord {
+                bidder: bidder.clone(),
+                amount,
+                ledger: env.ledger().sequence(),
+            },
+            BID_HISTORY_CAP,
+        );
 
         BidPlacedEvent {
             auction_id,
@@ -1475,6 +1504,21 @@ impl MarketplaceContract {
         load_auction(&env, auction_id)
             .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::AuctionNotFound))
     }
+
+    /// Return the bounded bid history for `auction_id` in chronological order
+    /// (oldest bid first, newest last).
+    ///
+    /// The history is capped to `BID_HISTORY_CAP` entries on-chain; older bids
+    /// beyond the cap are not available here (use the indexer for full history).
+    /// Returns an empty vector when no bids have been placed.
+    pub fn get_auction_bids(env: Env, auction_id: u64) -> Vec<BidRecord> {
+        // Verify the auction exists before returning history so callers get a
+        // clear AuctionNotFound error rather than an empty vec for a bad id.
+        load_auction(&env, auction_id)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::AuctionNotFound));
+        load_auction_bids(&env, auction_id)
+    }
+
     pub fn get_offer(env: Env, offer_id: u64) -> Offer {
         load_offer(&env, offer_id)
             .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::OfferNotFound))
