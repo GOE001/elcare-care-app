@@ -1434,6 +1434,125 @@ fn test_artist_revocation_flow() {
     );
 }
 
+// ── Issue #17: revocation enforcement on all creation paths ─────────────────
+// The listing path is already covered by the existing
+// `test_revoked_artist_cannot_create_listing`. The cases below add the auction
+// path, reinstatement of both paths, and settleability of existing items.
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn test_revoked_artist_cannot_create_auction() {
+    let (env, client, admin, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&admin);
+    client.add_token_to_whitelist(&token_id);
+
+    let artist = Address::generate(&env);
+    client.revoke_artist(&artist);
+
+    // A revoked artist creating an auction must also revert with ArtistRevoked
+    // (#15) — consistent with create_listing via the shared require_not_revoked
+    // guard (previously this path returned Unauthorized #5).
+    client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+}
+
+#[test]
+fn test_reinstated_artist_can_create_listing_and_auction() {
+    let (env, client, admin, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&admin);
+    client.add_token_to_whitelist(&token_id);
+
+    let artist = Address::generate(&env);
+    StellarAssetClient::new(&env, &token_id).mint(&artist, &100_000_000_000_i128);
+
+    client.revoke_artist(&artist);
+    client.reinstate_artist(&artist);
+
+    // Reinstatement removes the block on BOTH creation paths.
+    let listing_id = client.create_listing(
+        &artist,
+        &1_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+    assert_eq!(listing_id, 1u64);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+    assert_eq!(auction_id, 1u64);
+}
+
+#[test]
+fn test_revoked_artist_existing_listing_remains_settleable() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist); // artist is admin so it can revoke itself in-test
+    client.add_token_to_whitelist(&token_id);
+
+    // Listing is created BEFORE the artist is revoked.
+    let id = client.create_listing(
+        &artist,
+        &10_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    // Revoking the artist must NOT block settlement of their existing items.
+    client.revoke_artist(&artist);
+
+    let ok = client.buy_artwork(&buyer, &id);
+    assert!(ok);
+    let listing = client.get_listing(&id);
+    assert_eq!(listing.status, ListingStatus::Sold);
+    assert_eq!(listing.owner, Some(buyer.clone()));
+}
+
+#[test]
+fn test_revoked_artist_existing_auction_remains_finalizable() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // Auction created (and bid on) before revocation.
+    let id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+    client.place_bid(&buyer, &id, &1_500_000_i128);
+
+    // Revoke the artist; the in-flight auction must still finalize (settle).
+    client.revoke_artist(&artist);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+    client.finalize_auction(&buyer, &id);
+
+    let auction = client.get_auction(&id);
+    assert_eq!(auction.status, crate::types::AuctionStatus::Finalized);
+}
+
 #[test]
 fn test_update_listing_with_pending_offer_fails() {
     let (env, client, artist, buyer, token_id, contract_id, collection_id) = setup();

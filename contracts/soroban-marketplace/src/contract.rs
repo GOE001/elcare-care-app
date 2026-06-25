@@ -278,9 +278,7 @@ impl MarketplaceContract {
     ) -> u64 {
         Self::require_not_paused(&env);
         artist.require_auth();
-        if Self::is_artist_revoked(env.clone(), artist.clone()) {
-            panic_with_error!(&env, MarketplaceError::ArtistRevoked);
-        }
+        Self::require_not_revoked(&env, &artist);
         if price <= 0 {
             panic_with_error!(&env, MarketplaceError::InvalidPrice);
         }
@@ -597,9 +595,7 @@ impl MarketplaceContract {
     ) -> u64 {
         Self::require_not_paused(&env);
         creator.require_auth();
-        if Self::is_artist_revoked(env.clone(), creator.clone()) {
-            panic_with_error!(&env, MarketplaceError::Unauthorized);
-        }
+        Self::require_not_revoked(&env, &creator);
         if reserve_price <= 0 {
             panic_with_error!(&env, MarketplaceError::InvalidPrice);
         }
@@ -1050,6 +1046,17 @@ impl MarketplaceContract {
     fn require_not_paused(env: &Env) {
         if crate::storage::is_paused(env) {
             panic_with_error!(env, MarketplaceError::ContractPaused);
+        }
+    }
+
+    /// Guard that reverts with `ArtistRevoked` when `artist` has been revoked by
+    /// an admin. Call this after authentication at the start of every creation
+    /// path (listings, auctions) so a revoked artist can no longer create new
+    /// items. It deliberately does NOT guard settlement paths (buy, accept_offer,
+    /// finalize_auction), so existing items remain settleable after revocation.
+    fn require_not_revoked(env: &Env, artist: &Address) {
+        if is_artist_revoked_storage(env, artist) {
+            panic_with_error!(env, MarketplaceError::ArtistRevoked);
         }
     }
 
