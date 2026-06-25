@@ -22,6 +22,8 @@ pub const CONTRACT_PAUSED: Symbol = symbol_short!("ctr_psd");
 pub const CONTRACT_UNPAUSED: Symbol = symbol_short!("ctr_unpsd");
 pub const LISTING_PRICE_UPDATED: Symbol = symbol_short!("lst_pru");
 pub const LISTING_EXPIRED: Symbol = symbol_short!("lst_expd");
+pub const AUCTION_EXTENDED: Symbol = symbol_short!("auc_extd");
+pub const AUCTION_CANCELLED: Symbol = symbol_short!("auc_cncl");
 
 // Event data structs
 // Event data structs

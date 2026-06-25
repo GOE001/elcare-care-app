@@ -42,6 +42,17 @@ pub enum MarketplaceError {
     /// `expire_listing` was called on a listing whose `expires_at` is still in
     /// the future (or the listing has no expiry).
     ListingNotExpired = 28,
+    /// `migrate` was called but the migration marker for the current version is
+    /// already recorded — the migration has already been applied and the call
+    /// is a no-op (idempotent guard).
+    AlreadyMigrated = 29,
+    /// A listing or auction price falls outside the admin-configured
+    /// [min_price, max_price] bounds.  Either the price is below `min_price`
+    /// or above `max_price`.  Unset bounds are treated permissively (no limit).
+    PriceOutOfBounds = 30,
+    /// Caller of `cancel_auction` attempted to cancel an auction that already
+    /// has at least one bid.  Cancellation is blocked to protect escrowed funds.
+    AuctionHasBids = 31,
 }
 
 #[contracttype]

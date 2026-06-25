@@ -4787,7 +4787,7 @@ fn test_cancel_auction_emits_event() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #27)")]
+#[should_panic(expected = "Error(Contract, #31)")]
 fn test_cancel_auction_with_bids_reverts() {
     let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
     client.set_admin(&artist);
@@ -5490,4 +5490,427 @@ fn test_auction_protocol_fee_snapshot_field_set_at_creation() {
         300u32,
         "changing global fee must not retroactively update an existing auction's snapshot"
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONTRACT VERSIONING — version() view + migrate() entry point
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Acceptance criteria:
+//   1. version() returns the current CONTRACT_VERSION string.
+//   2. migrate() succeeds on the first call and records a marker.
+//   3. migrate() reverts with AlreadyMigrated (#29) on a second call (idempotent).
+//   4. migrate() is admin-only — non-admin callers revert with Unauthorized.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_version_returns_current_version() {
+    let (env, client, artist, _, _token_id, _contract_id, _collection_id) = setup();
+    client.set_admin(&artist);
+
+    let v = client.version();
+    // Compare against a soroban_sdk::String constructed from the same literal.
+    let expected = soroban_sdk::String::from_str(&env, "1.0.0");
+    assert_eq!(v, expected, "version() must return CONTRACT_VERSION");
+}
+
+#[test]
+fn test_migrate_first_call_succeeds() {
+    let (_env, client, artist, _, _token_id, _contract_id, _collection_id) = setup();
+    client.set_admin(&artist);
+
+    // First call should complete without panic.
+    client.migrate(&artist);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #29)")]
+fn test_migrate_second_call_reverts_already_migrated() {
+    let (_env, client, artist, _, _token_id, _contract_id, _collection_id) = setup();
+    client.set_admin(&artist);
+
+    // First call — must succeed.
+    client.migrate(&artist);
+
+    // Second call — must revert with AlreadyMigrated (#29).
+    client.migrate(&artist);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_migrate_non_admin_reverts_unauthorized() {
+    let (_env, client, artist, buyer, _token_id, _contract_id, _collection_id) = setup();
+    client.set_admin(&artist);
+
+    // Buyer is not the admin — must revert with Unauthorized (#5).
+    client.migrate(&buyer);
+}
+
+#[test]
+fn test_migrate_idempotency_marker_persists_after_admin_change() {
+    // After a successful migrate, the migration marker is keyed by version string,
+    // not by admin address — so even after an admin transfer the marker remains
+    // and a second migrate call still reverts.
+    let (env, client, artist, _, _token_id, _contract_id, _collection_id) = setup();
+    let new_admin = Address::generate(&env);
+    client.set_admin(&artist);
+
+    // First migrate — succeeds.
+    client.migrate(&artist);
+
+    // 2-step admin transfer to new_admin.
+    client.transfer_admin(&artist, &new_admin);
+    client.accept_admin(&new_admin);
+    assert_eq!(client.get_admin(), Some(new_admin.clone()));
+
+    // Second migrate with new admin — must still revert because the marker
+    // for "1.0.0" was already written during the first call.
+    let result = client.try_migrate(&new_admin);
+    assert!(
+        result.is_err(),
+        "migrate must be idempotent regardless of admin changes"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PRICE BOUNDS — set_price_bounds / get_price_bounds enforcement
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Acceptance criteria:
+//   1. Admin can set bounds with min <= max.
+//   2. set_price_bounds with min > max reverts with InvalidPrice.
+//   3. Listings below min_price revert with PriceOutOfBounds.
+//   4. Listings above max_price revert with PriceOutOfBounds.
+//   5. Prices within [min, max] succeed.
+//   6. Unset bounds are permissive (no restriction).
+//   7. Same enforcement applies to auction reserve prices.
+//   8. Non-admin cannot set bounds (reverts Unauthorized).
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_set_and_get_price_bounds_succeeds() {
+    let (_env, client, artist, _, _token_id, _contract_id, _collection_id) = setup();
+    client.set_admin(&artist);
+
+    client.set_price_bounds(&artist, &1_000_i128, &10_000_000_i128);
+
+    let (min, max) = client.get_price_bounds();
+    assert_eq!(min, Some(1_000_i128), "min_price must be stored");
+    assert_eq!(max, Some(10_000_000_i128), "max_price must be stored");
+}
+
+#[test]
+fn test_get_price_bounds_returns_none_when_unset() {
+    let (_env, client, artist, _, _token_id, _contract_id, _collection_id) = setup();
+    client.set_admin(&artist);
+
+    let (min, max) = client.get_price_bounds();
+    assert_eq!(min, None, "min_price must be None when not set");
+    assert_eq!(max, None, "max_price must be None when not set");
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")]
+fn test_set_price_bounds_min_greater_than_max_reverts() {
+    let (_env, client, artist, _, _token_id, _contract_id, _collection_id) = setup();
+    client.set_admin(&artist);
+
+    // min > max — must revert with InvalidPrice (#2).
+    client.set_price_bounds(&artist, &5_000_i128, &1_000_i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_set_price_bounds_non_admin_reverts() {
+    let (_env, client, artist, buyer, _token_id, _contract_id, _collection_id) = setup();
+    client.set_admin(&artist);
+
+    // Buyer is not the admin.
+    client.set_price_bounds(&buyer, &1_000_i128, &10_000_000_i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #30)")]
+fn test_create_listing_below_min_price_reverts() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // Set min price to 5_000
+    client.set_price_bounds(&artist, &5_000_i128, &100_000_000_i128);
+
+    // Try to create a listing at 1_000 — below min, must revert PriceOutOfBounds (#30).
+    client.create_listing(
+        &artist,
+        &1_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &valid_recipients(&env, &artist),
+        &None::<u64>,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #30)")]
+fn test_create_listing_above_max_price_reverts() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // Set max price to 1_000
+    client.set_price_bounds(&artist, &1_i128, &1_000_i128);
+
+    // Try to create a listing at 5_000 — above max, must revert PriceOutOfBounds (#30).
+    client.create_listing(
+        &artist,
+        &5_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &valid_recipients(&env, &artist),
+        &None::<u64>,
+    );
+}
+
+#[test]
+fn test_create_listing_within_bounds_succeeds() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    client.set_price_bounds(&artist, &1_000_i128, &10_000_000_i128);
+
+    // Price exactly at min bound.
+    let id1 = client.create_listing(
+        &artist,
+        &1_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &valid_recipients(&env, &artist),
+        &None::<u64>,
+    );
+    assert_eq!(id1, 1u64, "listing at min bound must succeed");
+
+    // Price exactly at max bound.
+    let id2 = client.create_listing(
+        &artist,
+        &10_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &valid_recipients(&env, &artist),
+        &None::<u64>,
+    );
+    assert_eq!(id2, 2u64, "listing at max bound must succeed");
+
+    // Price strictly within [min, max].
+    let id3 = client.create_listing(
+        &artist,
+        &5_000_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &valid_recipients(&env, &artist),
+        &None::<u64>,
+    );
+    assert_eq!(id3, 3u64, "listing within bounds must succeed");
+}
+
+#[test]
+fn test_create_listing_no_bounds_set_is_permissive() {
+    // When no bounds have been configured the contract must accept any positive price.
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // Very small price
+    let id1 = client.create_listing(
+        &artist,
+        &1_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &valid_recipients(&env, &artist),
+        &None::<u64>,
+    );
+    assert_eq!(id1, 1u64);
+
+    // Very large (but overflow-safe) price
+    let safe_max: i128 = i128::MAX / 10_000;
+    let id2 = client.create_listing(
+        &artist,
+        &safe_max,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &valid_recipients(&env, &artist),
+        &None::<u64>,
+    );
+    assert_eq!(id2, 2u64);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #30)")]
+fn test_create_auction_below_min_price_reverts() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    client.set_price_bounds(&artist, &5_000_i128, &100_000_000_i128);
+
+    // Reserve price 1_000 < min 5_000 — must revert with PriceOutOfBounds (#30).
+    client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_i128, // below min
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #30)")]
+fn test_create_auction_above_max_price_reverts() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    client.set_price_bounds(&artist, &1_i128, &1_000_i128);
+
+    // Reserve price 5_000 > max 1_000 — must revert with PriceOutOfBounds (#30).
+    client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &5_000_i128, // above max
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+}
+
+#[test]
+fn test_create_auction_within_bounds_succeeds() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    client.set_price_bounds(&artist, &1_000_i128, &10_000_000_i128);
+
+    let id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &5_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+    assert_eq!(id, 1u64, "auction within price bounds must succeed");
+}
+
+#[test]
+fn test_create_auction_no_bounds_is_permissive() {
+    // No bounds set — any positive reserve price must be accepted.
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // Very small reserve
+    let id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+    assert_eq!(id, 1u64, "auction with very small reserve must succeed when no bounds set");
+}
+
+#[test]
+fn test_price_bounds_equal_min_max_accepted() {
+    // Edge case: min == max is a valid configuration (only one exact price accepted).
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    client.set_price_bounds(&artist, &5_000_i128, &5_000_i128);
+
+    // Exact match — must succeed.
+    let id = client.create_listing(
+        &artist,
+        &5_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &valid_recipients(&env, &artist),
+        &None::<u64>,
+    );
+    assert_eq!(id, 1u64, "exact match on a point-range bound must succeed");
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #30)")]
+fn test_price_bounds_exact_match_point_range_miss_reverts() {
+    // When min == max, any price other than that exact value must be rejected.
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    client.set_price_bounds(&artist, &5_000_i128, &5_000_i128);
+
+    // 5_001 is one above the exact point — must revert.
+    client.create_listing(
+        &artist,
+        &5_001_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &valid_recipients(&env, &artist),
+        &None::<u64>,
+    );
+}
+
+#[test]
+fn test_price_bounds_updated_only_affects_new_listings() {
+    // Updating price bounds does NOT retroactively invalidate existing listings.
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // Create a listing at 1_000 while no bounds are set.
+    let id = client.create_listing(
+        &artist,
+        &1_000_i128,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &valid_recipients(&env, &artist),
+        &None::<u64>,
+    );
+
+    // Now set bounds that would have excluded this price.
+    client.set_price_bounds(&artist, &10_000_i128, &100_000_000_i128);
+
+    // The existing listing must still be purchasable.
+    let ok = client.buy_artwork(&buyer, &id);
+    assert!(ok, "existing listing must remain purchasable after bounds change");
+    let listing = client.get_listing(&id);
+    assert_eq!(listing.status, ListingStatus::Sold);
 }

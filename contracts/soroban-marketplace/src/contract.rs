@@ -23,6 +23,9 @@ use crate::{
         set_artist_revocation_storage, set_pending_admin_storage,
         get_auction_extension_window_storage, get_auction_extension_trigger_storage,
         set_auction_extension_window_storage, set_auction_extension_trigger_storage,
+        get_min_price_storage, get_max_price_storage,
+        set_min_price_storage, set_max_price_storage,
+        is_migration_done, set_migration_done,
     },
     types::{
         Auction, AuctionStatus, CancelReason, Listing, ListingStatus, MarketplaceError, Offer,
@@ -42,6 +45,19 @@ const DEFAULT_EXTENSION_WINDOW: u64 = 600;
 /// Default anti-sniping trigger: a bid placed when fewer than 5 minutes remain
 /// triggers the extension. Set to 0 to disable the feature by default.
 const DEFAULT_EXTENSION_TRIGGER: u64 = 0;
+
+/// Current semantic version of this contract.  Bump this string whenever a
+/// storage-shape change is introduced so that the `migrate` entry point can
+/// distinguish between already-applied and pending migrations.
+///
+/// Versioning policy
+/// -----------------
+/// * MAJOR (x.0.0): backward-incompatible storage layout changes that require
+///   all on-chain data to be re-encoded or dropped.
+/// * MINOR (1.x.0): new optional storage keys added; old clients can still read
+///   the existing keys without modification.
+/// * PATCH (1.0.x): bug fixes and documentation corrections; no storage changes.
+pub const CONTRACT_VERSION: &str = "1.0.0";
 
 #[contract]
 pub struct MarketplaceContract;
@@ -104,6 +120,102 @@ impl MarketplaceContract {
             new_admin,
         }
         .publish(&env);
+    }
+
+    // ── Contract versioning & migration ──────────────────────────
+
+    /// Returns the semantic version of this contract deployment.
+    ///
+    /// Callers (off-chain indexers, upgrade scripts) can use this to decide
+    /// whether a `migrate` call is necessary before using new storage keys.
+    pub fn version(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, CONTRACT_VERSION)
+    }
+
+    /// Admin-guarded, idempotent storage migration entry point.
+    ///
+    /// # Idempotency
+    /// The function records a per-version marker in persistent storage the
+    /// first time it is called.  Subsequent calls for the *same* version
+    /// revert with `AlreadyMigrated` so that accidental double-invocations
+    /// during upgrade scripts are caught rather than silently re-executed.
+    ///
+    /// # Usage
+    /// Upgrade scripts should:
+    /// 1. Deploy the new WASM and invoke `migrate(admin)`.
+    /// 2. Verify `version()` returns the expected string.
+    /// 3. Any data back-fill should be performed inside this function body
+    ///    for the specific version being migrated to.
+    pub fn migrate(env: Env, admin: Address) {
+        admin.require_auth();
+        let stored_admin = Self::get_admin(env.clone()).expect("admin not set");
+        if admin != stored_admin {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+
+        let version = soroban_sdk::String::from_str(&env, CONTRACT_VERSION);
+
+        // Guard: revert if this migration has already been applied.
+        if is_migration_done(&env, &version) {
+            panic_with_error!(&env, MarketplaceError::AlreadyMigrated);
+        }
+
+        // ── Per-version migration logic ──────────────────────────────
+        // Add version-specific storage shape changes here.  Each released
+        // version gets its own `if version == "x.y.z" { ... }` block.
+        // Example for a future 1.1.0 migration:
+        //   if version_str == "1.1.0" {
+        //       // back-fill new field on existing listings...
+        //   }
+        //
+        // For 1.0.0 there is no storage shape change — the marker alone
+        // establishes forward compatibility for subsequent upgrades.
+        // ────────────────────────────────────────────────────────────
+
+        // Record the migration marker so this version is not re-applied.
+        set_migration_done(&env, &version);
+    }
+
+    // ── Global price bounds ───────────────────────────────────────
+
+    /// Set global minimum and maximum price bounds for listings and auctions.
+    ///
+    /// Both `min` and `max` must be positive and `min <= max`.  Any subsequent
+    /// `create_listing` or `create_auction` call whose price falls outside
+    /// `[min, max]` will revert with `PriceOutOfBounds`.
+    ///
+    /// # Backward compatibility
+    /// Existing listings and auctions are NOT retroactively affected.  Only new
+    /// items created after the bounds are set are validated against them.
+    ///
+    /// # Disabling bounds
+    /// Pass `min = 0` or call the setter with very large values to make a bound
+    /// effectively permissive.  To fully remove bounds, `set_price_bounds` can
+    /// be called with `min = 1` and `max = i128::MAX / 10_000` (the existing
+    /// overflow-safety ceiling already applied in `update_listing_price`).
+    pub fn set_price_bounds(env: Env, admin: Address, min: i128, max: i128) {
+        admin.require_auth();
+        let stored_admin = Self::get_admin(env.clone()).expect("admin not set");
+        if admin != stored_admin {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        // Both bounds must be non-negative and min <= max.
+        if min < 0 || max < 0 || min > max {
+            panic_with_error!(&env, MarketplaceError::InvalidPrice);
+        }
+        set_min_price_storage(&env, min);
+        set_max_price_storage(&env, max);
+    }
+
+    /// Returns `(min_price, max_price)` — the current global price bounds.
+    ///
+    /// A value of `None` means the corresponding bound has not been configured
+    /// and is treated permissively (no limit in that direction).
+    pub fn get_price_bounds(env: Env) -> (Option<i128>, Option<i128>) {
+        (
+            get_min_price_storage(&env),
+            get_max_price_storage(&env),
+        )
     }
 
     pub fn set_treasury(env: Env, admin: Address, treasury: Address) {
@@ -348,6 +460,9 @@ impl MarketplaceContract {
         if price <= 0 {
             panic_with_error!(&env, MarketplaceError::InvalidPrice);
         }
+
+        // Enforce admin-configured global price bounds when set.
+        Self::require_price_in_bounds(&env, price);
 
         // Validate expiry is strictly in the future if provided
         if let Some(exp) = expires_at {
@@ -780,6 +895,8 @@ impl MarketplaceContract {
         if reserve_price <= 0 {
             panic_with_error!(&env, MarketplaceError::InvalidPrice);
         }
+        // Enforce admin-configured global price bounds when set.
+        Self::require_price_in_bounds(&env, reserve_price);
         if !Self::is_token_whitelisted(&env, &token) {
             panic_with_error!(&env, MarketplaceError::Unauthorized);
         }
@@ -1377,6 +1494,25 @@ impl MarketplaceContract {
             .get::<_, Address>(&key)
             .expect("admin not set");
         admin.require_auth();
+    }
+
+    /// Validates that `price` falls within the admin-configured
+    /// `[min_price, max_price]` bounds.  Missing bounds are treated permissively:
+    /// * no `min_price` stored → no lower bound enforced.
+    /// * no `max_price` stored → no upper bound enforced.
+    ///
+    /// Reverts with `PriceOutOfBounds` when the price violates a set bound.
+    fn require_price_in_bounds(env: &Env, price: i128) {
+        if let Some(min) = get_min_price_storage(env) {
+            if price < min {
+                panic_with_error!(env, MarketplaceError::PriceOutOfBounds);
+            }
+        }
+        if let Some(max) = get_max_price_storage(env) {
+            if price > max {
+                panic_with_error!(env, MarketplaceError::PriceOutOfBounds);
+            }
+        }
     }
 
     /// Guard function that reverts with ContractPaused if the contract is paused.
