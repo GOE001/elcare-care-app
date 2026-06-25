@@ -21,6 +21,8 @@ use crate::{
         release_listing_lock, remove_artist_revocation_storage, remove_from_active_listings,
         save_auction, save_listing, save_listing_offers, save_offer, save_offerer_offers,
         set_artist_revocation_storage, set_pending_admin_storage,
+        get_auction_extension_window_storage, get_auction_extension_trigger_storage,
+        set_auction_extension_window_storage, set_auction_extension_trigger_storage,
     },
     types::{
         Auction, AuctionStatus, CancelReason, Listing, ListingStatus, MarketplaceError, Offer,
@@ -32,6 +34,14 @@ use crate::{
 /// A value of 1 preserves the invariant that a new bid must strictly exceed the
 /// previous highest bid.
 const DEFAULT_MIN_BID_INCREMENT: i128 = 1;
+
+/// Default anti-sniping extension window: 10 minutes. New auctions inherit this
+/// unless the admin has configured a different value before auction creation.
+const DEFAULT_EXTENSION_WINDOW: u64 = 600;
+
+/// Default anti-sniping trigger: a bid placed when fewer than 5 minutes remain
+/// triggers the extension. Set to 0 to disable the feature by default.
+const DEFAULT_EXTENSION_TRIGGER: u64 = 0;
 
 #[contract]
 pub struct MarketplaceContract;
@@ -141,6 +151,38 @@ impl MarketplaceContract {
 
     pub fn get_min_bid_increment(env: Env) -> i128 {
         crate::storage::get_min_bid_increment_storage(&env).unwrap_or(DEFAULT_MIN_BID_INCREMENT)
+    }
+
+    /// Set the global auction extension window in seconds (anti-sniping feature).
+    /// When a qualifying bid arrives near the end of an auction, the end time is
+    /// extended by this many seconds. Admin-only. New auctions snapshot this value.
+    pub fn set_auction_extension_window(env: Env, admin: Address, window: u64) {
+        admin.require_auth();
+        let stored_admin = Self::get_admin(env.clone()).expect("admin not set");
+        if admin != stored_admin {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        set_auction_extension_window_storage(&env, window);
+    }
+
+    pub fn get_auction_extension_window(env: Env) -> u64 {
+        get_auction_extension_window_storage(&env).unwrap_or(DEFAULT_EXTENSION_WINDOW)
+    }
+
+    /// Set the global auction extension trigger threshold in seconds (anti-sniping).
+    /// If `end_time - now < trigger` when a bid is placed, the anti-sniping rule fires.
+    /// Admin-only. New auctions snapshot this value.
+    pub fn set_auction_extension_trigger(env: Env, admin: Address, trigger: u64) {
+        admin.require_auth();
+        let stored_admin = Self::get_admin(env.clone()).expect("admin not set");
+        if admin != stored_admin {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        set_auction_extension_trigger_storage(&env, trigger);
+    }
+
+    pub fn get_auction_extension_trigger(env: Env) -> u64 {
+        get_auction_extension_trigger_storage(&env).unwrap_or(DEFAULT_EXTENSION_TRIGGER)
     }
 
     // ── Pause/Unpause Mechanism ────────────────────────────
@@ -631,6 +673,16 @@ impl MarketplaceContract {
         // rules are fixed at creation time, regardless of later admin changes.
         let min_increment = crate::storage::get_min_bid_increment_storage(&env)
             .unwrap_or(DEFAULT_MIN_BID_INCREMENT);
+        // Snapshot the anti-sniping parameters so the auction's extension
+        // behaviour is determined at creation, not by future admin changes.
+        let extension_window = get_auction_extension_window_storage(&env)
+            .unwrap_or(DEFAULT_EXTENSION_WINDOW);
+        let extension_trigger = get_auction_extension_trigger_storage(&env)
+            .unwrap_or(DEFAULT_EXTENSION_TRIGGER);
+        // Snapshot the global protocol fee so settlement math is fixed at
+        // creation time — consistent with how listings work (ISSUE-005 parity).
+        let protocol_fee_bps =
+            crate::storage::get_protocol_fee_bps_storage(&env).unwrap_or(0);
         let auction = Auction {
             auction_id,
             creator: creator.clone(),
@@ -644,6 +696,9 @@ impl MarketplaceContract {
             status: AuctionStatus::Active,
             recipients,
             min_increment,
+            extension_window,
+            extension_trigger,
+            protocol_fee_bps,
         };
         save_auction(&env, &auction);
         add_artist_auction_id(&env, &creator, auction_id);
@@ -701,6 +756,21 @@ impl MarketplaceContract {
         // back, so escrow can never be left inconsistent.
         auction.highest_bid = amount;
         auction.highest_bidder = Some(bidder.clone());
+
+        // ── Anti-sniping: extend the auction when a bid arrives near the end ─
+        // Only fires when extension_trigger > 0 (opt-in). If the time remaining
+        // is strictly less than the trigger threshold, push the end time forward
+        // by the configured extension window.
+        let now = env.ledger().timestamp();
+        let time_remaining = auction.end_time.saturating_sub(now);
+        let mut extended = false;
+        if auction.extension_trigger > 0 && time_remaining < auction.extension_trigger {
+            auction.end_time = now
+                .checked_add(auction.extension_window)
+                .unwrap_or(auction.end_time);
+            extended = true;
+        }
+
         save_auction(&env, &auction);
 
         BidPlacedEvent {
@@ -709,6 +779,16 @@ impl MarketplaceContract {
             bid_amount: amount,
         }
         .publish(&env);
+
+        // Emit AuctionExtended after the bid event so indexers can correlate
+        // a single ledger's events: bid → optional extension.
+        if extended {
+            AuctionExtendedEvent {
+                auction_id,
+                new_end_time: auction.end_time,
+            }
+            .publish(&env);
+        }
 
         // ── INTERACTIONS ─────────────────────────────────────────────────────
         // Refund the previous bidder's escrow, then pull the new bid into escrow.
@@ -722,10 +802,25 @@ impl MarketplaceContract {
     }
 
     pub fn finalize_auction(env: Env, caller: Address, auction_id: u64) {
+        // ─────────────────────────────────────────────────────────────────────
+        // CHECKS-EFFECTS-INTERACTIONS ordering:
+        //   1. Acquire reentrancy lock.
+        //   2. Load & validate auction (status + time).
+        //   3. Mutate state to Finalized/Cancelled (Effects).
+        //   4. Emit event (Effects).
+        //   5. Execute all external calls — token payout and NFT transfer
+        //      (Interactions).
+        //   6. Release lock.
+        //
+        // Any caller may finalize once `now >= end_time`.  Early calls revert
+        // with AuctionNotEnded so the auction cannot be settled prematurely.
+        // A second call on an already-settled auction reverts with
+        // AuctionAlreadyFinalized regardless of who calls.
+        // ─────────────────────────────────────────────────────────────────────
         Self::require_not_paused(&env);
         caller.require_auth();
 
-        // Reentrancy guard
+        // ── 1. Reentrancy guard ───────────────────────────────────────────────
         if !acquire_auction_lock(&env, auction_id) {
             panic_with_error!(&env, MarketplaceError::ReentrancyGuard);
         }
@@ -738,65 +833,130 @@ impl MarketplaceContract {
             }
         };
 
-        // Status check
+        // ── 2. Checks ─────────────────────────────────────────────────────────
+        // Status: reject any attempt on an already-settled auction.
         if auction.status != AuctionStatus::Active {
             release_auction_lock(&env, auction_id);
             panic_with_error!(&env, MarketplaceError::AuctionAlreadyFinalized);
         }
 
-        // Time check
+        // Time: anyone may finalize only after the auction has ended.
         if env.ledger().timestamp() < auction.end_time {
-            if caller != auction.creator {
-                release_auction_lock(&env, auction_id);
-                panic_with_error!(&env, MarketplaceError::Unauthorized);
-            }
+            release_auction_lock(&env, auction_id);
+            panic_with_error!(&env, MarketplaceError::AuctionNotEnded);
         }
 
-        let (finalized_winner, finalized_amount) =
-            if let Some(ref winner) = auction.highest_bidder.clone() {
-                // Auctions use the live global protocol fee at finalization time.
-                // (Auctions are not listings and do not snapshot the fee at creation.)
-                let auction_fee_bps =
-                    crate::storage::get_protocol_fee_bps_storage(&env).unwrap_or(0);
-                Self::distribute_payout(
-                    &env,
-                    &auction.token,
-                    &auction.collection,
-                    auction.highest_bid,
-                    &auction.creator,
-                    &auction.recipients,
-                    winner,
-                    false,
-                    auction_fee_bps,
-                );
+        // ── 3. Effects — mutate state before any interaction ──────────────────
+        // Capture settlement data before overwriting auction fields.
+        let winner = auction.highest_bidder.clone();
+        let winning_bid = auction.highest_bid;
+        let snapshotted_fee = auction.protocol_fee_bps;
 
-                // Transfer the NFT
-                env.invoke_contract::<()>(
-                    &auction.collection,
-                    &soroban_sdk::Symbol::new(&env, "transfer_from"),
-                    soroban_sdk::vec![
-                        &env,
-                        env.current_contract_address().into_val(&env),
-                        auction.creator.into_val(&env),
-                        winner.into_val(&env),
-                        auction.token_id.into_val(&env)
-                    ],
-                );
-
-                auction.status = AuctionStatus::Finalized;
-                (Some(winner.clone()), auction.highest_bid)
-            } else {
-                auction.status = AuctionStatus::Cancelled;
-                (None, 0)
-            };
-
+        if winner.is_some() {
+            auction.status = AuctionStatus::Finalized;
+        } else {
+            auction.status = AuctionStatus::Cancelled;
+        }
         save_auction(&env, &auction);
-        release_auction_lock(&env, auction_id);
 
+        // ── 4. Event ──────────────────────────────────────────────────────────
         AuctionFinalizedEvent {
             auction_id,
-            winner: finalized_winner,
-            amount: finalized_amount,
+            winner: winner.clone(),
+            amount: winning_bid,
+        }
+        .publish(&env);
+
+        // ── 5. Interactions — external calls after state is final ─────────────
+        if let Some(ref w) = winner {
+            // Distribute the winning bid to the creator and their recipients
+            // using the fee rate snapshotted at auction creation — this gives
+            // the creator and bidder certainty about the net settlement amount
+            // from the moment the auction was created (parity with listings).
+            Self::distribute_payout(
+                &env,
+                &auction.token,
+                &auction.collection,
+                winning_bid,
+                &auction.creator,
+                &auction.recipients,
+                w,
+                false, // funds are already held in escrow; do not pull from winner
+                snapshotted_fee,
+            );
+
+            // Transfer the NFT from the creator to the winner.
+            env.invoke_contract::<()>(
+                &auction.collection,
+                &soroban_sdk::Symbol::new(&env, "transfer_from"),
+                soroban_sdk::vec![
+                    &env,
+                    env.current_contract_address().into_val(&env),
+                    auction.creator.into_val(&env),
+                    w.into_val(&env),
+                    auction.token_id.into_val(&env)
+                ],
+            );
+        } else {
+            // No bids — return the NFT to the creator so they are not locked out.
+            env.invoke_contract::<()>(
+                &auction.collection,
+                &soroban_sdk::Symbol::new(&env, "transfer_from"),
+                soroban_sdk::vec![
+                    &env,
+                    env.current_contract_address().into_val(&env),
+                    auction.creator.into_val(&env),
+                    auction.creator.into_val(&env),
+                    auction.token_id.into_val(&env)
+                ],
+            );
+        }
+
+        // ── 6. Release lock ───────────────────────────────────────────────────
+        release_auction_lock(&env, auction_id);
+    }
+
+    /// Cancel an auction that has received **no bids**.
+    ///
+    /// Rules:
+    /// - Only the auction creator may call this.
+    /// - If `highest_bidder` is `Some(_)` the call reverts with `AuctionHasBids`
+    ///   to protect the bidder's escrowed funds.
+    /// - The auction must be `Active`; attempting to cancel an already-finalised
+    ///   or already-cancelled auction reverts with `AuctionAlreadyFinalized`.
+    ///
+    /// On success:
+    /// - Auction status is set to `Cancelled`.
+    /// - `AuctionCancelledEvent` is emitted.
+    pub fn cancel_auction(env: Env, creator: Address, auction_id: u64) {
+        Self::require_not_paused(&env);
+        creator.require_auth();
+
+        let mut auction = load_auction(&env, auction_id)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::AuctionNotFound));
+
+        // Only the original creator may cancel.
+        if auction.creator != creator {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+
+        // Must be active — finalized / already-cancelled auctions cannot be cancelled again.
+        if auction.status != AuctionStatus::Active {
+            panic_with_error!(&env, MarketplaceError::AuctionAlreadyFinalized);
+        }
+
+        // Refuse if any bid has been placed — the bidder's escrow must not be stranded.
+        if auction.highest_bidder.is_some() {
+            panic_with_error!(&env, MarketplaceError::AuctionHasBids);
+        }
+
+        // ── EFFECTS ──────────────────────────────────────────────────────────
+        auction.status = AuctionStatus::Cancelled;
+        save_auction(&env, &auction);
+
+        AuctionCancelledEvent {
+            auction_id,
+            cancelled_by: creator.clone(),
         }
         .publish(&env);
     }

@@ -26,6 +26,11 @@ pub enum DataKey {
     PendingAdmin,
     ActiveListings,
     MinBidIncrement,
+    /// Global extension window in seconds (anti-sniping: how long to add).
+    AuctionExtensionWindow,
+    /// Global extension trigger threshold in seconds (anti-sniping: fires when
+    /// `end_time - now < threshold` at bid time).
+    AuctionExtensionTrigger,
 }
 
 pub const LEDGER_TTL_BUMP: u32 = 432_000;
@@ -351,6 +356,44 @@ pub fn get_min_bid_increment_storage(env: &Env) -> Option<i128> {
     let value = env.storage().persistent().get(&DataKey::MinBidIncrement);
     if value.is_some() {
         bump_entry_ttl(env, &DataKey::MinBidIncrement);
+    }
+    value
+}
+
+// ── Anti-sniping config ──────────────────────────────────────
+
+pub fn set_auction_extension_window_storage(env: &Env, window: u64) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::AuctionExtensionWindow, &window);
+    bump_entry_ttl(env, &DataKey::AuctionExtensionWindow);
+}
+
+pub fn get_auction_extension_window_storage(env: &Env) -> Option<u64> {
+    let value = env
+        .storage()
+        .persistent()
+        .get(&DataKey::AuctionExtensionWindow);
+    if value.is_some() {
+        bump_entry_ttl(env, &DataKey::AuctionExtensionWindow);
+    }
+    value
+}
+
+pub fn set_auction_extension_trigger_storage(env: &Env, trigger: u64) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::AuctionExtensionTrigger, &trigger);
+    bump_entry_ttl(env, &DataKey::AuctionExtensionTrigger);
+}
+
+pub fn get_auction_extension_trigger_storage(env: &Env) -> Option<u64> {
+    let value = env
+        .storage()
+        .persistent()
+        .get(&DataKey::AuctionExtensionTrigger);
+    if value.is_some() {
+        bump_entry_ttl(env, &DataKey::AuctionExtensionTrigger);
     }
     value
 }

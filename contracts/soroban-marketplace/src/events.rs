@@ -20,8 +20,8 @@ pub const ARTIST_REVOKED: Symbol = symbol_short!("art_rvkd");
 pub const ARTIST_REINSTATED: Symbol = symbol_short!("art_rnst");
 pub const CONTRACT_PAUSED: Symbol = symbol_short!("ctr_psd");
 pub const CONTRACT_UNPAUSED: Symbol = symbol_short!("ctr_unpsd");
-
-// Event data structs
+pub const AUCTION_EXTENDED: Symbol = symbol_short!("auc_extd");
+pub const AUCTION_CANCELLED: Symbol = symbol_short!("auc_cncl");
 // Event data structs
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -136,6 +136,37 @@ impl AuctionFinalizedEvent {
     #[allow(deprecated)]
     pub fn publish(self, env: &Env) {
         env.events().publish((AUCTION_RESOLVED,), self);
+    }
+}
+
+/// Emitted when a qualifying late bid triggers the anti-sniping extension rule.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuctionExtendedEvent {
+    pub auction_id: u64,
+    /// The new end time after the extension has been applied.
+    pub new_end_time: u64,
+}
+
+impl AuctionExtendedEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events().publish((AUCTION_EXTENDED,), self);
+    }
+}
+
+/// Emitted when a creator cancels an auction that has received no bids.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuctionCancelledEvent {
+    pub auction_id: u64,
+    pub cancelled_by: Address,
+}
+
+impl AuctionCancelledEvent {
+    #[allow(deprecated)]
+    pub fn publish(self, env: &Env) {
+        env.events().publish((AUCTION_CANCELLED,), self);
     }
 }
 

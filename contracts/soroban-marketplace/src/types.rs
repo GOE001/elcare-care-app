@@ -1,5 +1,5 @@
 // types.rs
-use soroban_sdk::{contracterror, contracttype, Address, Bytes, Symbol};
+use soroban_sdk::{contracterror, contracttype, Address, Symbol};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -36,6 +36,13 @@ pub enum MarketplaceError {
     /// 10 000 bps (100%).  Rejected at listing creation and on any update that
     /// would mutate recipients, so an invalid split can never be persisted.
     RoyaltyExceedsLimit = 26,
+    /// cancel_auction was called on an auction that already has at least one bid.
+    /// Cancelling with an active highest bidder would strand their escrowed funds.
+    AuctionHasBids = 27,
+    /// finalize_auction was called before the auction's end_time. Any caller
+    /// (other than the original creator in previous behaviour) must wait until
+    /// the auction has actually expired.
+    AuctionNotEnded = 28,
 }
 
 #[contracttype]
@@ -116,6 +123,17 @@ pub struct Auction {
     /// snapshotted from the global setting at auction creation. The first bid is
     /// instead gated by `reserve_price`.
     pub min_increment: i128,
+    /// How many seconds to extend the auction when a qualifying late bid arrives.
+    /// Snapshotted from the global setting at auction creation time.
+    pub extension_window: u64,
+    /// If `end_time - now < extension_trigger` seconds at bid time, the auction
+    /// end is extended by `extension_window`. Snapshotted at creation time.
+    pub extension_trigger: u64,
+    /// Protocol fee in basis points snapshotted from the global setting at
+    /// auction creation time. This ensures settlement math is fixed when the
+    /// auction is created, giving bidders and the creator certainty about the
+    /// net payout — consistent with how listings behave.
+    pub protocol_fee_bps: u32,
 }
 
 #[contracttype]

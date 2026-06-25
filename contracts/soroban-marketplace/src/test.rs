@@ -1105,8 +1105,10 @@ fn test_finalize_auction_no_bids() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #5)")]
+#[should_panic(expected = "Error(Contract, #28)")]
 fn test_finalize_auction_before_expiry_rejects_non_creator() {
+    // Under the new rules, ALL callers — including the creator — are rejected
+    // with AuctionNotEnded (#28) when finalize is called before end_time.
     let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
     client.set_admin(&artist);
     client.add_token_to_whitelist(&token_id);
@@ -4371,5 +4373,1066 @@ fn test_outbid_refunds_prev_and_escrow_equals_highest_bid() {
         token.balance(&contract_id) - contract_base,
         auction.highest_bid,
         "escrow must equal the current highest bid"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Anti-sniping extension (Feature A)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Acceptance criteria:
+//   1. A bid placed inside the trigger window extends end_time and emits
+//      AuctionExtended.
+//   2. A bid placed outside the trigger window (or when trigger == 0) does NOT
+//      extend end_time and does NOT emit AuctionExtended.
+//   3. finalize_auction respects the extended end_time (cannot be called by a
+//      non-creator before the (new) end_time).
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Helper to create an auction whose extension parameters are set in global
+/// config before creation (so they are snapshotted into the auction struct).
+fn create_auction_with_extension(
+    env: &Env,
+    client: &MarketplaceContractClient,
+    admin: &Address,
+    creator: &Address,
+    token_id: &Address,
+    collection_id: &Address,
+    duration: u64,
+    extension_window: u64,
+    extension_trigger: u64,
+) -> u64 {
+    // Configure the global anti-sniping parameters before auction creation so
+    // that the new auction inherits them as its snapshotted values.
+    client.set_auction_extension_window(admin, &extension_window);
+    client.set_auction_extension_trigger(admin, &extension_trigger);
+    client.create_auction(
+        creator,
+        token_id,
+        collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &duration,
+        &valid_recipients(env, creator),
+    )
+}
+
+#[test]
+fn test_bid_inside_trigger_window_extends_auction() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // Auction runs for 3600 s; trigger fires if < 300 s remain;
+    // extension adds 600 s.
+    let duration = 3600u64;
+    let trigger = 300u64;
+    let window = 600u64;
+
+    let auction_id = create_auction_with_extension(
+        &env, &client, &artist, &artist, &token_id, &collection_id,
+        duration, window, trigger,
+    );
+
+    // Advance time to 3400 s into the auction (200 s remaining < 300 s trigger).
+    let start = env.ledger().timestamp();
+    env.ledger().set_timestamp(start + 3400);
+
+    let before = client.get_auction(&auction_id);
+    let original_end = before.end_time;
+
+    // This bid should trigger the extension.
+    client.place_bid(&buyer, &auction_id, &1_500_000_i128);
+
+    let after = client.get_auction(&auction_id);
+    let now = env.ledger().timestamp();
+    let expected_end = now + window;
+    assert_eq!(
+        after.end_time, expected_end,
+        "end_time must be extended to now + extension_window"
+    );
+    assert!(after.end_time > original_end, "end_time must be strictly later than original");
+
+    // Verify AuctionExtended event was emitted.
+    let events = env.events().all();
+    let extended_events: soroban_sdk::Vec<_> = events
+        .iter()
+        .filter(|e| {
+            use soroban_sdk::xdr::{ContractEventBody, ScVal};
+            if let ContractEventBody::V0(body) = &e.body {
+                body.topics.iter().any(|t| {
+                    if let ScVal::Symbol(s) = t {
+                        core::str::from_utf8(s.0.as_slice()).unwrap_or("") == "auc_extd"
+                    } else {
+                        false
+                    }
+                })
+            } else {
+                false
+            }
+        })
+        .collect();
+    assert_eq!(
+        extended_events.len(),
+        1,
+        "exactly one AuctionExtended event must be emitted"
+    );
+}
+
+#[test]
+fn test_bid_outside_trigger_window_does_not_extend() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // Auction runs for 3600 s; trigger fires only if < 300 s remain.
+    let duration = 3600u64;
+    let trigger = 300u64;
+    let window = 600u64;
+
+    let auction_id = create_auction_with_extension(
+        &env, &client, &artist, &artist, &token_id, &collection_id,
+        duration, window, trigger,
+    );
+
+    // Advance time to only 1000 s in (2600 s remaining >> 300 s trigger).
+    let start = env.ledger().timestamp();
+    env.ledger().set_timestamp(start + 1000);
+
+    let before = client.get_auction(&auction_id);
+    let original_end = before.end_time;
+
+    // Bid well outside the trigger window — no extension should happen.
+    client.place_bid(&buyer, &auction_id, &1_500_000_i128);
+
+    let after = client.get_auction(&auction_id);
+    assert_eq!(
+        after.end_time, original_end,
+        "end_time must remain unchanged when bid is outside the trigger window"
+    );
+
+    // Verify NO AuctionExtended event was emitted.
+    let events = env.events().all();
+    let extended_events: soroban_sdk::Vec<_> = events
+        .iter()
+        .filter(|e| {
+            use soroban_sdk::xdr::{ContractEventBody, ScVal};
+            if let ContractEventBody::V0(body) = &e.body {
+                body.topics.iter().any(|t| {
+                    if let ScVal::Symbol(s) = t {
+                        core::str::from_utf8(s.0.as_slice()).unwrap_or("") == "auc_extd"
+                    } else {
+                        false
+                    }
+                })
+            } else {
+                false
+            }
+        })
+        .collect();
+    assert_eq!(
+        extended_events.len(),
+        0,
+        "no AuctionExtended event must be emitted when bid is outside the trigger window"
+    );
+}
+
+#[test]
+fn test_bid_with_trigger_zero_never_extends() {
+    // When extension_trigger == 0 the feature is disabled regardless of timing.
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let duration = 3600u64;
+    let auction_id = create_auction_with_extension(
+        &env, &client, &artist, &artist, &token_id, &collection_id,
+        duration, 600u64, 0u64, // trigger == 0 → disabled
+    );
+
+    // Jump to the very last second of the auction.
+    let start = env.ledger().timestamp();
+    env.ledger().set_timestamp(start + 3599);
+
+    let before = client.get_auction(&auction_id);
+    let original_end = before.end_time;
+
+    client.place_bid(&buyer, &auction_id, &1_500_000_i128);
+
+    let after = client.get_auction(&auction_id);
+    assert_eq!(
+        after.end_time, original_end,
+        "end_time must not change when trigger == 0 (feature disabled)"
+    );
+}
+
+#[test]
+fn test_finalize_respects_extended_end_time() {
+    // After a late bid extends the auction, a non-creator must NOT be able to
+    // finalize until the NEW end_time has elapsed.
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let duration = 3600u64;
+    let trigger = 300u64;
+    let window = 600u64;
+
+    let auction_id = create_auction_with_extension(
+        &env, &client, &artist, &artist, &token_id, &collection_id,
+        duration, window, trigger,
+    );
+
+    // Jump to 200 s remaining → inside trigger window.
+    let start = env.ledger().timestamp();
+    env.ledger().set_timestamp(start + 3400);
+    client.place_bid(&buyer, &auction_id, &1_500_000_i128);
+
+    let after_bid = client.get_auction(&auction_id);
+    let new_end = after_bid.end_time;
+
+    // Jump to just past the ORIGINAL end but before the NEW end.
+    // (original end = start + 3600, new end = bid_time + window = start + 3400 + 600 = start + 4000)
+    env.ledger().set_timestamp(start + 3601);
+
+    // Non-creator (buyer) cannot finalize before the extended end_time.
+    let result = client.try_finalize_auction(&buyer, &auction_id);
+    assert!(result.is_err(), "finalize must fail before the extended end_time");
+
+    // Advance past the new end_time.
+    env.ledger().set_timestamp(new_end + 1);
+
+    // Now finalize must succeed.
+    client.finalize_auction(&buyer, &auction_id);
+    let finished = client.get_auction(&auction_id);
+    assert_eq!(
+        finished.status,
+        crate::types::AuctionStatus::Finalized,
+        "auction must be finalized after the extended end_time"
+    );
+}
+
+#[test]
+fn test_multiple_late_bids_each_reset_end_time() {
+    // Every qualifying late bid resets end_time to now + window,
+    // so consecutive snipe attempts keep pushing the deadline forward.
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    let buyer2 = Address::generate(&env);
+    soroban_sdk::token::StellarAssetClient::new(&env, &token_id)
+        .mint(&buyer2, &100_000_000_000_i128);
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let duration = 3600u64;
+    let trigger = 300u64;
+    let window = 600u64;
+
+    let auction_id = create_auction_with_extension(
+        &env, &client, &artist, &artist, &token_id, &collection_id,
+        duration, window, trigger,
+    );
+
+    let start = env.ledger().timestamp();
+
+    // First late bid at 200 s remaining.
+    env.ledger().set_timestamp(start + 3400);
+    client.place_bid(&buyer, &auction_id, &1_500_000_i128);
+    let end1 = client.get_auction(&auction_id).end_time;
+    assert_eq!(end1, start + 3400 + window);
+
+    // Second late bid 100 s later (still within the extended window and the trigger).
+    env.ledger().set_timestamp(start + 3500);
+    client.place_bid(&buyer2, &auction_id, &2_000_000_i128);
+    let end2 = client.get_auction(&auction_id).end_time;
+    assert_eq!(end2, start + 3500 + window, "second late bid must push end_time forward again");
+    assert!(end2 > end1, "each late bid must produce a later deadline");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Cancel Auction (Feature B)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Acceptance criteria:
+//   1. An auction with no bids can be cancelled by its creator.
+//   2. An auction with at least one bid CANNOT be cancelled (reverts with
+//      AuctionHasBids #27).
+//   3. Cancellation emits AuctionCancelledEvent.
+//   4. A non-creator cannot cancel the auction.
+//   5. A finalized / already-cancelled auction cannot be cancelled again.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_cancel_auction_no_bids_succeeds() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    client.cancel_auction(&artist, &auction_id);
+
+    let auction = client.get_auction(&auction_id);
+    assert_eq!(
+        auction.status,
+        crate::types::AuctionStatus::Cancelled,
+        "auction must be Cancelled after cancel_auction with no bids"
+    );
+}
+
+#[test]
+fn test_cancel_auction_emits_event() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    client.cancel_auction(&artist, &auction_id);
+
+    // Verify AuctionCancelled event was emitted.
+    let events = env.events().all();
+    let cancel_events: soroban_sdk::Vec<_> = events
+        .iter()
+        .filter(|e| {
+            use soroban_sdk::xdr::{ContractEventBody, ScVal};
+            if let ContractEventBody::V0(body) = &e.body {
+                body.topics.iter().any(|t| {
+                    if let ScVal::Symbol(s) = t {
+                        core::str::from_utf8(s.0.as_slice()).unwrap_or("") == "auc_cncl"
+                    } else {
+                        false
+                    }
+                })
+            } else {
+                false
+            }
+        })
+        .collect();
+    assert_eq!(
+        cancel_events.len(),
+        1,
+        "exactly one AuctionCancelledEvent must be emitted"
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #27)")]
+fn test_cancel_auction_with_bids_reverts() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    // Place a bid so the auction has an active highest bidder.
+    client.place_bid(&buyer, &auction_id, &1_500_000_i128);
+
+    // This must revert with AuctionHasBids (#27).
+    client.cancel_auction(&artist, &auction_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_cancel_auction_non_creator_reverts() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    // Buyer tries to cancel — must revert with Unauthorized (#5).
+    client.cancel_auction(&buyer, &auction_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")]
+fn test_cancel_already_cancelled_auction_reverts() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    client.cancel_auction(&artist, &auction_id);
+    // Second cancellation must revert with AuctionAlreadyFinalized (#14).
+    client.cancel_auction(&artist, &auction_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")]
+fn test_cancel_finalized_auction_reverts() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    client.place_bid(&buyer, &auction_id, &1_500_000_i128);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+    client.finalize_auction(&buyer, &auction_id);
+
+    // Auction is now Finalized; cancel must revert with AuctionAlreadyFinalized (#14).
+    client.cancel_auction(&artist, &auction_id);
+}
+
+#[test]
+fn test_cancel_auction_bidder_escrow_is_safe() {
+    // Verify that once a bid exists, cancellation is blocked and the bidder's
+    // escrow is never stranded.
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let bid_amount = 1_500_000_i128;
+    client.place_bid(&buyer, &auction_id, &bid_amount);
+
+    let token = TokenClient::new(&env, &token_id);
+    let buyer_balance_after_bid = token.balance(&buyer);
+
+    // Attempt to cancel (must fail) — buyer's escrowed funds remain safe.
+    let result = client.try_cancel_auction(&artist, &auction_id);
+    assert!(
+        result.is_err(),
+        "cancel_auction must fail when a bid is present"
+    );
+
+    // Bidder's balance has not changed since the failed cancel.
+    assert_eq!(
+        token.balance(&buyer),
+        buyer_balance_after_bid,
+        "bidder's balance must not change after a failed cancel attempt"
+    );
+
+    // Clean up: finalize the auction to release the escrow properly.
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+    client.finalize_auction(&buyer, &auction_id);
+    // After finalization the bidder's escrowed amount has been transferred to
+    // the creator (payout), so the buyer's final balance is less by bid_amount.
+    assert_eq!(
+        token.balance(&buyer),
+        100_000_000_000_i128 - bid_amount,
+        "after finalization, buyer balance must reflect the winning bid"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Finalize-auction: open access + strict end-time + double-finalize guard
+// (Feature A — finalize_auction hardening)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Acceptance criteria:
+//   1. Any caller can finalize AFTER end_time — not just the creator.
+//   2. Finalize BEFORE end_time reverts with AuctionNotEnded (#28).
+//   3. A second finalize on an already-settled auction reverts with
+//      AuctionAlreadyFinalized (#14).
+//   4. No-bid auction ends with status Cancelled and the NFT returned to creator.
+//   5. Normal finalize (with a winner) settles funds and marks Finalized.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+#[should_panic(expected = "Error(Contract, #28)")]
+fn test_finalize_before_end_time_reverts() {
+    // Nobody — not even the creator — may finalize before the auction ends.
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    // Attempt finalize at t = 0 (well before end_time) — must revert.
+    client.finalize_auction(&artist, &auction_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #28)")]
+fn test_finalize_one_second_early_reverts() {
+    // Edge case: exactly one second before end_time.
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let duration = 3600u64;
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &duration,
+        &valid_recipients(&env, &artist),
+    );
+
+    // Advance to exactly 1 second before the end.
+    env.ledger().set_timestamp(env.ledger().timestamp() + duration - 1);
+    client.finalize_auction(&artist, &auction_id);
+}
+
+#[test]
+fn test_any_caller_can_finalize_after_end_time() {
+    // A random third party (not the creator, not the bidder) may finalize.
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    let third_party = Address::generate(&env);
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    client.place_bid(&buyer, &auction_id, &1_500_000_i128);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+
+    // Third party finalizes — must succeed.
+    client.finalize_auction(&third_party, &auction_id);
+
+    let auction = client.get_auction(&auction_id);
+    assert_eq!(auction.status, AuctionStatus::Finalized);
+    assert_eq!(auction.highest_bidder, Some(buyer));
+}
+
+#[test]
+fn test_creator_can_finalize_after_end_time() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    client.place_bid(&buyer, &auction_id, &1_500_000_i128);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+
+    // Creator finalizes their own auction.
+    client.finalize_auction(&artist, &auction_id);
+
+    let auction = client.get_auction(&auction_id);
+    assert_eq!(auction.status, AuctionStatus::Finalized);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")]
+fn test_double_finalize_reverts() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    client.place_bid(&buyer, &auction_id, &1_500_000_i128);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+
+    client.finalize_auction(&buyer, &auction_id);
+    // Second call must revert with AuctionAlreadyFinalized.
+    client.finalize_auction(&buyer, &auction_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")]
+fn test_double_finalize_no_bid_reverts() {
+    // Double-finalize on a no-bid auction (status becomes Cancelled on first call).
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+    client.finalize_auction(&artist, &auction_id);
+    // Auction is now Cancelled; second call must still revert.
+    client.finalize_auction(&artist, &auction_id);
+}
+
+#[test]
+fn test_finalize_no_bid_auction_status_is_cancelled() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+    client.finalize_auction(&artist, &auction_id);
+
+    let auction = client.get_auction(&auction_id);
+    assert_eq!(
+        auction.status,
+        AuctionStatus::Cancelled,
+        "a no-bid auction must be marked Cancelled after finalization"
+    );
+    assert!(
+        auction.highest_bidder.is_none(),
+        "no winner should be recorded for a no-bid auction"
+    );
+}
+
+#[test]
+fn test_finalize_no_bid_returns_nft_to_creator() {
+    // The mock NFT transfer_from records nothing, but the call must not panic.
+    // This test verifies the code path executes without error.
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+    // Must not panic — the NFT transfer_from(contract, creator, creator, token_id)
+    // path through the mock succeeds silently.
+    client.finalize_auction(&artist, &auction_id);
+
+    let auction = client.get_auction(&auction_id);
+    assert_eq!(auction.status, AuctionStatus::Cancelled);
+}
+
+#[test]
+fn test_finalize_with_winner_transfers_funds() {
+    // Verify the winning bid amount is routed away from the contract address
+    // (i.e. ends up with the creator/recipients) after finalization.
+    let (env, client, artist, buyer, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let bid_amount = 1_500_000_i128;
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    client.place_bid(&buyer, &auction_id, &bid_amount);
+
+    let token = TokenClient::new(&env, &token_id);
+    let artist_before = token.balance(&artist);
+    let contract_escrow = token.balance(&contract_id);
+
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+    client.finalize_auction(&buyer, &auction_id);
+
+    // All escrowed funds must leave the contract.
+    let contract_after = token.balance(&contract_id);
+    assert_eq!(
+        contract_after,
+        contract_escrow - bid_amount,
+        "full bid escrow must leave the contract after finalization"
+    );
+
+    // Creator must receive the bid amount (no fee or royalty configured in this test).
+    let artist_after = token.balance(&artist);
+    assert_eq!(
+        artist_after,
+        artist_before + bid_amount,
+        "creator must receive the full bid when no fee or royalty is set"
+    );
+
+    let auction = client.get_auction(&auction_id);
+    assert_eq!(auction.status, AuctionStatus::Finalized);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Auction settlement parity with direct sales (Feature B)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Acceptance criteria:
+//   1. Auction payout equals direct-sale payout at the same price/recipients/fee.
+//   2. The protocol fee snapshot taken at auction creation is honoured even if
+//      the admin changes the global fee between creation and finalization.
+//   3. Both code paths call the same distribute_payout helper (structural).
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Set up a scenario with a treasury, a non-zero protocol fee, and return the
+/// treasury address alongside the standard setup tuple. The fee is set AFTER
+/// listing/auction creation to isolate snapshot behaviour in tests that need it.
+fn setup_with_treasury() -> (
+    Env,
+    MarketplaceContractClient<'static>,
+    Address, // artist / creator
+    Address, // buyer / bidder
+    Address, // token_id (payment token)
+    Address, // contract_id
+    Address, // collection_id
+    Address, // treasury
+) {
+    let (env, client, artist, buyer, token_id, contract_id, collection_id) = setup();
+    let treasury = Address::generate(&env);
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+    client.set_treasury(&artist, &treasury);
+    (env, client, artist, buyer, token_id, contract_id, collection_id, treasury)
+}
+
+#[test]
+fn test_auction_payout_matches_direct_sale_payout() {
+    // Create a direct listing and an auction with identical price, recipients,
+    // and protocol fee. Verify the seller receives the same net amount from
+    // both settlement paths.
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id, treasury) =
+        setup_with_treasury();
+
+    let price = 10_000_000_i128;
+    let fee_bps = 500u32; // 5 %
+
+    // ── Direct listing path ──────────────────────────────────────────────
+    // Create listing BEFORE setting the fee so snapshot is 0 (matches the
+    // auction snapshot below which is also taken before the fee is set).
+    let listing_id = client.create_listing(
+        &artist,
+        &price,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    // Set fee AFTER listing creation — listing snapshot stays 0.
+    // Then reset fee to 0 so auction snapshot below is also 0.
+    // (We will create the auction with fee=0 snapshotted, same as listing.)
+    // Actually: create both with fee=0 snapshotted, then set fee=500 globally.
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &2u64, // different token_id so NFT mock doesn't conflict
+        &price,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    // NOW set the global fee to 500 bps; both items have fee=0 snapshotted.
+    client.set_protocol_fee(&artist, &fee_bps);
+
+    let token = TokenClient::new(&env, &token_id);
+    let artist_before_listing = token.balance(&artist);
+
+    // Settle via direct buy.
+    client.buy_artwork(&buyer, &listing_id);
+
+    let artist_after_listing = token.balance(&artist);
+    let listing_payout = artist_after_listing - artist_before_listing;
+
+    // For the auction, use a fresh buyer with funds.
+    let bidder = Address::generate(&env);
+    soroban_sdk::token::StellarAssetClient::new(&env, &token_id)
+        .mint(&bidder, &100_000_000_000_i128);
+
+    let artist_before_auction = token.balance(&artist);
+
+    client.place_bid(&bidder, &auction_id, &price);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+    client.finalize_auction(&bidder, &auction_id);
+
+    let artist_after_auction = token.balance(&artist);
+    let auction_payout = artist_after_auction - artist_before_auction;
+
+    assert_eq!(
+        listing_payout, auction_payout,
+        "auction payout must equal direct-sale payout at equal price/fee/recipients"
+    );
+}
+
+#[test]
+fn test_auction_fee_snapshot_honoured_after_global_fee_change() {
+    // Auction created with fee=500 bps snapshotted. Admin then raises the
+    // global fee to 1000 bps. Finalization must use 500, not 1000.
+    let (env, client, artist, _, token_id, _contract_id, collection_id, treasury) =
+        setup_with_treasury();
+
+    let price = 10_000_000_i128;
+
+    // Set global fee to 500 bps BEFORE auction creation so it gets snapshotted.
+    client.set_protocol_fee(&artist, &500u32);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &price,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    // Admin raises the global fee AFTER creation — must not affect this auction.
+    client.set_protocol_fee(&artist, &1000u32);
+
+    let bidder = Address::generate(&env);
+    soroban_sdk::token::StellarAssetClient::new(&env, &token_id)
+        .mint(&bidder, &100_000_000_000_i128);
+
+    client.place_bid(&bidder, &auction_id, &price);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+
+    let token = TokenClient::new(&env, &token_id);
+    let treasury_before = token.balance(&treasury);
+    let artist_before = token.balance(&artist);
+
+    client.finalize_auction(&bidder, &auction_id);
+
+    let treasury_after = token.balance(&treasury);
+    let artist_after = token.balance(&artist);
+
+    // Expected fee at 500 bps (snapshotted), NOT 1000 bps (current global).
+    let expected_fee = price * 500 / 10_000; // = 500_000
+    let expected_seller = price - expected_fee;  // = 9_500_000
+
+    assert_eq!(
+        treasury_after - treasury_before,
+        expected_fee,
+        "treasury must receive 500 bps fee (snapshotted at creation), not 1000 bps"
+    );
+    assert_eq!(
+        artist_after - artist_before,
+        expected_seller,
+        "creator must receive bid minus the 500 bps snapshotted fee"
+    );
+}
+
+#[test]
+fn test_auction_fee_zero_snapshot_seller_gets_full_amount() {
+    // When no fee is set at creation time, the creator should receive
+    // the entire winning bid (no treasury deduction).
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id, treasury) =
+        setup_with_treasury();
+
+    let bid_amount = 5_000_000_i128;
+
+    // Fee is NOT set before auction creation → snapshot is 0.
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &bid_amount,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    // Set a non-zero global fee after creation; snapshot must shield the auction.
+    client.set_protocol_fee(&artist, &1000u32);
+
+    client.place_bid(&buyer, &auction_id, &bid_amount);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+
+    let token = TokenClient::new(&env, &token_id);
+    let artist_before = token.balance(&artist);
+    let treasury_before = token.balance(&treasury);
+
+    client.finalize_auction(&buyer, &auction_id);
+
+    assert_eq!(
+        token.balance(&artist) - artist_before,
+        bid_amount,
+        "creator must receive the full bid when fee snapshot is zero"
+    );
+    assert_eq!(
+        token.balance(&treasury) - treasury_before,
+        0,
+        "treasury must receive nothing when fee snapshot is zero"
+    );
+}
+
+#[test]
+fn test_auction_settlement_with_fee_and_royalty_matches_listing() {
+    // Both paths must produce identical payouts when royalty_bps > 0 but
+    // royalty_receiver == seller (royalty is skipped in both cases).
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id, _treasury) =
+        setup_with_treasury();
+
+    let price = 10_000_000_i128;
+    // No protocol fee (snapshot = 0), no treasury impact.
+    // MockNft always returns royalty_bps=0, so royalty branch is skipped.
+
+    let listing_id = client.create_listing(
+        &artist,
+        &price,
+        &symbol_short!("XLM"),
+        &token_id,
+        &collection_id,
+        &1u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &2u64,
+        &price,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let token = TokenClient::new(&env, &token_id);
+
+    // Direct sale.
+    let before_direct = token.balance(&artist);
+    client.buy_artwork(&buyer, &listing_id);
+    let direct_gain = token.balance(&artist) - before_direct;
+
+    // Auction sale.
+    let bidder = Address::generate(&env);
+    soroban_sdk::token::StellarAssetClient::new(&env, &token_id)
+        .mint(&bidder, &100_000_000_000_i128);
+    let before_auction = token.balance(&artist);
+    client.place_bid(&bidder, &auction_id, &price);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+    client.finalize_auction(&bidder, &auction_id);
+    let auction_gain = token.balance(&artist) - before_auction;
+
+    assert_eq!(
+        direct_gain, auction_gain,
+        "direct-sale and auction settlement must produce identical creator gains"
+    );
+}
+
+#[test]
+fn test_auction_protocol_fee_snapshot_field_set_at_creation() {
+    // Directly inspect the snapshotted field on the stored Auction struct.
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // Set global fee to 300 bps before creation.
+    client.set_protocol_fee(&artist, &300u32);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let auction = client.get_auction(&auction_id);
+    assert_eq!(
+        auction.protocol_fee_bps,
+        300u32,
+        "protocol_fee_bps must be snapshotted from the global setting at creation"
+    );
+
+    // Change global fee; snapshot on existing auction must be unchanged.
+    client.set_protocol_fee(&artist, &700u32);
+    let auction_after = client.get_auction(&auction_id);
+    assert_eq!(
+        auction_after.protocol_fee_bps,
+        300u32,
+        "changing global fee must not retroactively update an existing auction's snapshot"
     );
 }
