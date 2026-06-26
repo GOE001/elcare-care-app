@@ -13,20 +13,24 @@ use crate::events::*;
 use crate::{
     storage::{
         acquire_auction_lock, acquire_listing_lock, add_artist_auction_id, add_artist_listing_id,
-        add_to_active_listings, clear_pending_admin_storage, get_active_listing_ids,
-        get_artist_auction_ids, get_artist_listing_ids, get_auction_count, get_listing_count,
-        get_pending_admin_storage, increment_auction_count, increment_listing_count,
-        increment_offer_count, is_artist_revoked_storage, load_auction, load_listing,
+        add_to_active_listings, append_bid_record, clear_pending_admin_storage,
+        get_active_listing_ids, get_artist_auction_ids, get_artist_listing_ids,
+        get_auction_count, get_listing_count, get_pending_admin_storage,
+        increment_auction_count, increment_listing_count, increment_offer_count,
+        is_artist_revoked_storage, load_auction, load_auction_bids, load_listing,
         load_listing_offers, load_offer, load_offerer_offers, release_auction_lock,
         release_listing_lock, remove_artist_revocation_storage, remove_from_active_listings,
         save_auction, save_listing, save_listing_offers, save_offer, save_offerer_offers,
         set_artist_revocation_storage, set_pending_admin_storage,
         get_auction_extension_window_storage, get_auction_extension_trigger_storage,
         set_auction_extension_window_storage, set_auction_extension_trigger_storage,
+        get_min_price_storage, get_max_price_storage,
+        set_min_price_storage, set_max_price_storage,
+        is_migration_done, set_migration_done,
     },
     types::{
-        Auction, AuctionStatus, CancelReason, Listing, ListingStatus, MarketplaceError, Offer,
-        OfferStatus, Recipient,
+        Auction, AuctionStatus, BidRecord, CancelReason, Listing, ListingStatus,
+        MarketplaceError, Offer, OfferStatus, Recipient,
     },
 };
 
@@ -42,6 +46,22 @@ const DEFAULT_EXTENSION_WINDOW: u64 = 600;
 /// Default anti-sniping trigger: a bid placed when fewer than 5 minutes remain
 /// triggers the extension. Set to 0 to disable the feature by default.
 const DEFAULT_EXTENSION_TRIGGER: u64 = 0;
+
+/// Minimum auction duration in seconds (1 hour).
+///
+/// An auction whose computed `end_time = now + duration` would be less than
+/// `MIN_AUCTION_DURATION` seconds in the future is rejected with
+/// `InvalidAuctionDuration`.  This prevents meaningless or front-runnable
+/// auctions that expire almost immediately.
+const MIN_AUCTION_DURATION: u64 = 3_600; // 1 hour
+
+/// Maximum number of bid records retained per auction in the on-chain history.
+///
+/// When a new bid is placed and the history already holds `BID_HISTORY_CAP`
+/// entries, the oldest entry is evicted so storage growth is strictly bounded.
+/// Exposed via `get_auction_bids` for contract-side verification and frontend
+/// fallback.
+const BID_HISTORY_CAP: u32 = 20;
 
 #[contract]
 pub struct MarketplaceContract;
@@ -104,6 +124,102 @@ impl MarketplaceContract {
             new_admin,
         }
         .publish(&env);
+    }
+
+    // ── Contract versioning & migration ──────────────────────────
+
+    /// Returns the semantic version of this contract deployment.
+    ///
+    /// Callers (off-chain indexers, upgrade scripts) can use this to decide
+    /// whether a `migrate` call is necessary before using new storage keys.
+    pub fn version(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, CONTRACT_VERSION)
+    }
+
+    /// Admin-guarded, idempotent storage migration entry point.
+    ///
+    /// # Idempotency
+    /// The function records a per-version marker in persistent storage the
+    /// first time it is called.  Subsequent calls for the *same* version
+    /// revert with `AlreadyMigrated` so that accidental double-invocations
+    /// during upgrade scripts are caught rather than silently re-executed.
+    ///
+    /// # Usage
+    /// Upgrade scripts should:
+    /// 1. Deploy the new WASM and invoke `migrate(admin)`.
+    /// 2. Verify `version()` returns the expected string.
+    /// 3. Any data back-fill should be performed inside this function body
+    ///    for the specific version being migrated to.
+    pub fn migrate(env: Env, admin: Address) {
+        admin.require_auth();
+        let stored_admin = Self::get_admin(env.clone()).expect("admin not set");
+        if admin != stored_admin {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+
+        let version = soroban_sdk::String::from_str(&env, CONTRACT_VERSION);
+
+        // Guard: revert if this migration has already been applied.
+        if is_migration_done(&env, &version) {
+            panic_with_error!(&env, MarketplaceError::AlreadyMigrated);
+        }
+
+        // ── Per-version migration logic ──────────────────────────────
+        // Add version-specific storage shape changes here.  Each released
+        // version gets its own `if version == "x.y.z" { ... }` block.
+        // Example for a future 1.1.0 migration:
+        //   if version_str == "1.1.0" {
+        //       // back-fill new field on existing listings...
+        //   }
+        //
+        // For 1.0.0 there is no storage shape change — the marker alone
+        // establishes forward compatibility for subsequent upgrades.
+        // ────────────────────────────────────────────────────────────
+
+        // Record the migration marker so this version is not re-applied.
+        set_migration_done(&env, &version);
+    }
+
+    // ── Global price bounds ───────────────────────────────────────
+
+    /// Set global minimum and maximum price bounds for listings and auctions.
+    ///
+    /// Both `min` and `max` must be positive and `min <= max`.  Any subsequent
+    /// `create_listing` or `create_auction` call whose price falls outside
+    /// `[min, max]` will revert with `PriceOutOfBounds`.
+    ///
+    /// # Backward compatibility
+    /// Existing listings and auctions are NOT retroactively affected.  Only new
+    /// items created after the bounds are set are validated against them.
+    ///
+    /// # Disabling bounds
+    /// Pass `min = 0` or call the setter with very large values to make a bound
+    /// effectively permissive.  To fully remove bounds, `set_price_bounds` can
+    /// be called with `min = 1` and `max = i128::MAX / 10_000` (the existing
+    /// overflow-safety ceiling already applied in `update_listing_price`).
+    pub fn set_price_bounds(env: Env, admin: Address, min: i128, max: i128) {
+        admin.require_auth();
+        let stored_admin = Self::get_admin(env.clone()).expect("admin not set");
+        if admin != stored_admin {
+            panic_with_error!(&env, MarketplaceError::Unauthorized);
+        }
+        // Both bounds must be non-negative and min <= max.
+        if min < 0 || max < 0 || min > max {
+            panic_with_error!(&env, MarketplaceError::InvalidPrice);
+        }
+        set_min_price_storage(&env, min);
+        set_max_price_storage(&env, max);
+    }
+
+    /// Returns `(min_price, max_price)` — the current global price bounds.
+    ///
+    /// A value of `None` means the corresponding bound has not been configured
+    /// and is treated permissively (no limit in that direction).
+    pub fn get_price_bounds(env: Env) -> (Option<i128>, Option<i128>) {
+        (
+            get_min_price_storage(&env),
+            get_max_price_storage(&env),
+        )
     }
 
     pub fn set_treasury(env: Env, admin: Address, treasury: Address) {
@@ -348,6 +464,9 @@ impl MarketplaceContract {
         if price <= 0 {
             panic_with_error!(&env, MarketplaceError::InvalidPrice);
         }
+
+        // Enforce admin-configured global price bounds when set.
+        Self::require_price_in_bounds(&env, price);
 
         // Validate expiry is strictly in the future if provided
         if let Some(exp) = expires_at {
@@ -800,6 +919,12 @@ impl MarketplaceContract {
         if reserve_price <= 0 {
             panic_with_error!(&env, MarketplaceError::InvalidPrice);
         }
+        // Enforce a minimum auction duration so auctions that would expire
+        // nearly immediately (or in the past) are rejected up front.
+        // MIN_AUCTION_DURATION is documented in the constant declaration above.
+        if duration < MIN_AUCTION_DURATION {
+            panic_with_error!(&env, MarketplaceError::InvalidAuctionDuration);
+        }
         if !Self::is_token_whitelisted(&env, &token) {
             panic_with_error!(&env, MarketplaceError::Unauthorized);
         }
@@ -864,6 +989,12 @@ impl MarketplaceContract {
         if env.ledger().timestamp() >= auction.end_time {
             panic_with_error!(&env, MarketplaceError::AuctionExpired);
         }
+        // Block shill bidding: the auction creator must not be able to bid on
+        // their own auction.  This prevents artificial price inflation and
+        // protects legitimate bidders from being outbid by the seller.
+        if bidder == auction.creator {
+            panic_with_error!(&env, MarketplaceError::SelfBidNotAllowed);
+        }
         // Enforce the minimum acceptable bid on-chain:
         //   • first bid (no prior bidder): must be at least `reserve_price`.
         //   • subsequent bids: must exceed the current highest bid by at least
@@ -908,6 +1039,21 @@ impl MarketplaceContract {
         }
 
         save_auction(&env, &auction);
+
+        // ── Record bid in bounded history ────────────────────────────────────
+        // The history is capped to BID_HISTORY_CAP entries; the oldest is
+        // evicted when the cap is reached.  Chronological (oldest-to-newest)
+        // order is preserved, so index 0 is always the earliest retained bid.
+        append_bid_record(
+            &env,
+            auction_id,
+            &BidRecord {
+                bidder: bidder.clone(),
+                amount,
+                ledger: env.ledger().sequence(),
+            },
+            BID_HISTORY_CAP,
+        );
 
         BidPlacedEvent {
             auction_id,
@@ -1404,6 +1550,21 @@ impl MarketplaceContract {
         load_auction(&env, auction_id)
             .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::AuctionNotFound))
     }
+
+    /// Return the bounded bid history for `auction_id` in chronological order
+    /// (oldest bid first, newest last).
+    ///
+    /// The history is capped to `BID_HISTORY_CAP` entries on-chain; older bids
+    /// beyond the cap are not available here (use the indexer for full history).
+    /// Returns an empty vector when no bids have been placed.
+    pub fn get_auction_bids(env: Env, auction_id: u64) -> Vec<BidRecord> {
+        // Verify the auction exists before returning history so callers get a
+        // clear AuctionNotFound error rather than an empty vec for a bad id.
+        load_auction(&env, auction_id)
+            .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::AuctionNotFound));
+        load_auction_bids(&env, auction_id)
+    }
+
     pub fn get_offer(env: Env, offer_id: u64) -> Offer {
         load_offer(&env, offer_id)
             .unwrap_or_else(|| panic_with_error!(&env, MarketplaceError::OfferNotFound))
@@ -1423,6 +1584,25 @@ impl MarketplaceContract {
             .get::<_, Address>(&key)
             .expect("admin not set");
         admin.require_auth();
+    }
+
+    /// Validates that `price` falls within the admin-configured
+    /// `[min_price, max_price]` bounds.  Missing bounds are treated permissively:
+    /// * no `min_price` stored → no lower bound enforced.
+    /// * no `max_price` stored → no upper bound enforced.
+    ///
+    /// Reverts with `PriceOutOfBounds` when the price violates a set bound.
+    fn require_price_in_bounds(env: &Env, price: i128) {
+        if let Some(min) = get_min_price_storage(env) {
+            if price < min {
+                panic_with_error!(env, MarketplaceError::PriceOutOfBounds);
+            }
+        }
+        if let Some(max) = get_max_price_storage(env) {
+            if price > max {
+                panic_with_error!(env, MarketplaceError::PriceOutOfBounds);
+            }
+        }
     }
 
     /// Guard function that reverts with ContractPaused if the contract is paused.

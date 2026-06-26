@@ -42,14 +42,18 @@ pub enum MarketplaceError {
     /// `expire_listing` was called on a listing whose `expires_at` is still in
     /// the future (or the listing has no expiry).
     ListingNotExpired = 28,
-    /// A buyer attempted to purchase a listing they own (artist or current owner).
-    /// Dedicated error code so indexers and clients can surface a clear,
-    /// human-readable rejection reason distinct from the generic Unauthorized.
-    SelfPurchaseNotAllowed = 29,
-    /// finalize_auction was called before the auction end_time has passed.
-    AuctionNotEnded = 30,
-    /// cancel_auction was called on an auction that already has bids placed.
-    AuctionHasBids = 31,
+    /// `finalize_auction` was called before `end_time` has passed.
+    AuctionNotEnded = 29,
+    /// `cancel_auction` was called on an auction that already has at least one
+    /// bid — cancelling would strand the bidder's escrowed funds.
+    AuctionHasBids = 30,
+    /// `create_auction` was called with an `end_time` (or `duration`) that is in
+    /// the past or shorter than `MIN_AUCTION_DURATION`.
+    InvalidAuctionDuration = 31,
+    /// `place_bid` was called by the auction creator — self-bidding (shill
+    /// bidding) is not allowed.  The bidder address must differ from the
+    /// auction's `creator` field.
+    SelfBidNotAllowed = 32,
 }
 
 #[contracttype]
@@ -147,6 +151,22 @@ pub struct Auction {
     /// auction is created, giving bidders and the creator certainty about the
     /// net payout — consistent with how listings behave.
     pub protocol_fee_bps: u32,
+}
+
+/// A single entry in the per-auction bounded bid history.
+///
+/// The history is capped to `BID_HISTORY_CAP` entries (see `contract.rs`).
+/// When the cap is reached the oldest entry is evicted so only the most
+/// recent N bids are ever persisted.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BidRecord {
+    /// The account that placed this bid.
+    pub bidder: Address,
+    /// The bid amount (in the auction's payment token stroops).
+    pub amount: i128,
+    /// The ledger sequence number at which this bid was recorded.
+    pub ledger: u32,
 }
 
 #[contracttype]

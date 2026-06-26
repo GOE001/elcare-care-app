@@ -23,7 +23,6 @@ pub const CONTRACT_PAUSED: Symbol = symbol_short!("ctr_psd");
 pub const CONTRACT_UNPAUSED: Symbol = symbol_short!("ctr_unpsd");
 pub const LISTING_PRICE_UPDATED: Symbol = symbol_short!("lst_pru");
 pub const LISTING_EXPIRED: Symbol = symbol_short!("lst_expd");
-pub const PROTOCOL_FEE_COLLECTED: Symbol = symbol_short!("fee_cltd");
 pub const AUCTION_EXTENDED: Symbol = symbol_short!("auc_ext");
 pub const AUCTION_CANCELLED: Symbol = symbol_short!("auc_cncl");
 

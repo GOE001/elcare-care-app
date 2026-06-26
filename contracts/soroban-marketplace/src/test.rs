@@ -1519,6 +1519,7 @@ fn test_reinstated_artist_can_create_listing_and_auction() {
         &collection_id,
         &1u64,
         &valid_recipients(&env, &artist),
+        &None::<u64>,
     );
     assert_eq!(listing_id, 1u64);
 
@@ -1549,6 +1550,7 @@ fn test_revoked_artist_existing_listing_remains_settleable() {
         &collection_id,
         &1u64,
         &valid_recipients(&env, &artist),
+        &None::<u64>,
     );
 
     // Revoking the artist must NOT block settlement of their existing items.
@@ -4264,6 +4266,7 @@ fn test_err_contract_paused_create_listing() {
         &collection_id,
         &1u64,
         &valid_recipients(&env, &artist),
+        &None::<u64>,
     );
 }
 
@@ -4283,6 +4286,7 @@ fn test_err_artist_revoked_create_listing() {
         &collection_id,
         &1u64,
         &valid_recipients(&env, &artist),
+        &None::<u64>,
     );
 }
 
@@ -4302,6 +4306,7 @@ fn test_err_invalid_price_zero_listing_price() {
         &collection_id,
         &1u64,
         &valid_recipients(&env, &artist),
+        &None::<u64>,
     );
 }
 
@@ -4326,6 +4331,7 @@ fn test_err_listing_not_active_update_cancelled() {
         &collection_id,
         &1u64,
         &valid_recipients(&env, &artist),
+        &None::<u64>,
     );
     client.cancel_listing(&artist, &id);
     client.update_listing(&artist, &id, &2_000_000_i128, &token_id, &valid_recipients(&env, &artist));
@@ -4345,6 +4351,7 @@ fn test_err_cannot_buy_own_listing() {
         &collection_id,
         &1u64,
         &valid_recipients(&env, &artist),
+        &None::<u64>,
     );
     client.buy_artwork(&artist, &id);
 }
@@ -4364,6 +4371,7 @@ fn test_err_invalid_split_empty_recipients() {
         &collection_id,
         &1u64,
         &empty,
+        &None::<u64>,
     );
 }
 
@@ -4389,6 +4397,7 @@ fn test_err_too_many_recipients() {
         &collection_id,
         &1u64,
         &recipients,
+        &None::<u64>,
     );
 }
 
@@ -4411,6 +4420,7 @@ fn test_err_royalty_exceeds_limit() {
         &collection_id,
         &1u64,
         &recipients,
+        &None::<u64>,
     );
 }
 
@@ -4428,6 +4438,7 @@ fn test_err_listing_sold_double_buy() {
         &collection_id,
         &1u64,
         &valid_recipients(&env, &artist),
+        &None::<u64>,
     );
     client.buy_artwork(&buyer, &id);
     let buyer2 = Address::generate(&env);
@@ -4449,6 +4460,7 @@ fn test_err_listing_cancelled_buy() {
         &collection_id,
         &1u64,
         &valid_recipients(&env, &artist),
+        &None::<u64>,
     );
     client.cancel_listing(&artist, &id);
     client.buy_artwork(&buyer, &id); // Cancelled
@@ -4471,6 +4483,7 @@ fn test_err_token_not_whitelisted_buy() {
         &collection_id,
         &1u64,
         &valid_recipients(&env, &artist),
+        &None::<u64>,
     );
     // Remove the listing's token; whitelist is still non-empty (has other_token).
     client.remove_token_from_whitelist(&token_id);
@@ -5047,7 +5060,7 @@ fn test_cancel_auction_emits_event() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #27)")]
+#[should_panic(expected = "Error(Contract, #31)")]
 fn test_cancel_auction_with_bids_reverts() {
     let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
     client.set_admin(&artist);
@@ -5512,6 +5525,7 @@ fn test_auction_payout_matches_direct_sale_payout() {
         &collection_id,
         &1u64,
         &valid_recipients(&env, &artist),
+        &None::<u64>,
     );
 
     // Set fee AFTER listing creation — listing snapshot stays 0.
@@ -5680,6 +5694,7 @@ fn test_auction_settlement_with_fee_and_royalty_matches_listing() {
         &collection_id,
         &1u64,
         &valid_recipients(&env, &artist),
+        &None::<u64>,
     );
 
     let auction_id = client.create_auction(
@@ -5750,4 +5765,929 @@ fn test_auction_protocol_fee_snapshot_field_set_at_creation() {
         300u32,
         "changing global fee must not retroactively update an existing auction's snapshot"
     );
+}
+
+// =============================================================================
+// Bounded bid history — get_auction_bids (Feature: BID_HISTORY_CAP)
+// =============================================================================
+//
+// Acceptance criteria:
+//   1. Bids are returned in chronological order (oldest → newest).
+//   2. The history is capped; oldest entries are evicted beyond the cap.
+//   3. get_auction_bids on an unknown auction returns AuctionNotFound (#9).
+//   4. get_auction_bids on a fresh auction (no bids) returns an empty vector.
+// =============================================================================
+
+#[test]
+fn test_get_auction_bids_empty_before_any_bid() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let history = client.get_auction_bids(&auction_id);
+    assert_eq!(history.len(), 0, "bid history must be empty before any bids");
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn test_get_auction_bids_unknown_auction_reverts() {
+    let (_env, client, _, _, _, _, _) = setup();
+    client.get_auction_bids(&999u64);
+}
+
+#[test]
+fn test_get_auction_bids_single_bid_recorded() {
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    client.place_bid(&buyer, &auction_id, &1_500_000_i128);
+
+    let history = client.get_auction_bids(&auction_id);
+    assert_eq!(history.len(), 1, "one bid must produce one history entry");
+
+    let record = history.get(0).unwrap();
+    assert_eq!(record.bidder, buyer, "record must carry the correct bidder");
+    assert_eq!(record.amount, 1_500_000_i128, "record must carry the correct amount");
+}
+
+#[test]
+fn test_get_auction_bids_ordering_oldest_to_newest() {
+    // Place three bids from three different bidders and verify the history is
+    // returned in chronological (oldest-first) order.
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let bidder2 = Address::generate(&env);
+    let bidder3 = Address::generate(&env);
+    let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
+    sac.mint(&bidder2, &100_000_000_000_i128);
+    sac.mint(&bidder3, &100_000_000_000_i128);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    // Bids in ascending order (each must exceed the previous).
+    client.place_bid(&buyer,   &auction_id, &1_000_000_i128);
+    client.place_bid(&bidder2, &auction_id, &2_000_000_i128);
+    client.place_bid(&bidder3, &auction_id, &3_000_000_i128);
+
+    let history = client.get_auction_bids(&auction_id);
+    assert_eq!(history.len(), 3, "all three bids must appear in history");
+
+    // Verify chronological order by checking amounts.
+    assert_eq!(history.get(0).unwrap().amount, 1_000_000_i128, "index 0: first (oldest) bid");
+    assert_eq!(history.get(1).unwrap().amount, 2_000_000_i128, "index 1: second bid");
+    assert_eq!(history.get(2).unwrap().amount, 3_000_000_i128, "index 2: third (newest) bid");
+
+    // Verify correct bidder addresses.
+    assert_eq!(history.get(0).unwrap().bidder, buyer);
+    assert_eq!(history.get(1).unwrap().bidder, bidder2);
+    assert_eq!(history.get(2).unwrap().bidder, bidder3);
+}
+
+#[test]
+fn test_get_auction_bids_cap_evicts_oldest_entry() {
+    // Place BID_HISTORY_CAP + 1 bids (21 total) and verify:
+    //   - history.len() == BID_HISTORY_CAP (20)
+    //   - the first recorded bid is gone (evicted)
+    //   - the last recorded bid is present as the newest entry
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    // Generate and fund 21 distinct bidders.
+    let bid_count: u32 = 21; // one more than BID_HISTORY_CAP (20)
+    let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
+    let mut bidders: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&env);
+    for _ in 0..bid_count {
+        let b = Address::generate(&env);
+        sac.mint(&b, &100_000_000_000_i128);
+        bidders.push_back(b);
+    }
+
+    // Place 21 bids in ascending order (bid n costs n * 1_000_000 stroops).
+    for i in 0..bid_count {
+        let amount = (i as i128 + 1) * 1_000_000_i128;
+        client.place_bid(&bidders.get(i).unwrap(), &auction_id, &amount);
+    }
+
+    let history = client.get_auction_bids(&auction_id);
+
+    // The cap is 20 — exactly 20 entries must remain.
+    assert_eq!(
+        history.len(),
+        20,
+        "history must be capped at BID_HISTORY_CAP (20) entries"
+    );
+
+    // The very first bid (amount = 1_000_000) must have been evicted.
+    let oldest_retained = history.get(0).unwrap();
+    assert_eq!(
+        oldest_retained.amount,
+        2_000_000_i128,
+        "oldest retained entry must be the second bid (first was evicted)"
+    );
+
+    // The newest bid (amount = 21_000_000) must be at the tail.
+    let newest = history.get(19).unwrap();
+    assert_eq!(
+        newest.amount,
+        21_000_000_i128,
+        "newest entry must be the last placed bid"
+    );
+    assert_eq!(
+        newest.bidder,
+        bidders.get(20).unwrap(),
+        "newest bidder address must match"
+    );
+}
+
+#[test]
+fn test_get_auction_bids_multiple_cap_evictions() {
+    // Place 25 bids (5 beyond cap=20) and verify only the last 20 remain.
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let bid_count: u32 = 25;
+    let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
+    for i in 0..bid_count {
+        let b = Address::generate(&env);
+        sac.mint(&b, &100_000_000_000_i128);
+        let amount = (i as i128 + 1) * 1_000_000_i128;
+        client.place_bid(&b, &auction_id, &amount);
+    }
+
+    let history = client.get_auction_bids(&auction_id);
+    assert_eq!(history.len(), 20, "only the last 20 bids must be retained");
+
+    // Oldest retained must be bid #6 (amount = 6_000_000); bids 1-5 are evicted.
+    assert_eq!(
+        history.get(0).unwrap().amount,
+        6_000_000_i128,
+        "oldest retained entry must be bid #6"
+    );
+    // Newest must be bid #25.
+    assert_eq!(
+        history.get(19).unwrap().amount,
+        25_000_000_i128,
+        "newest entry must be bid #25"
+    );
+}
+
+#[test]
+fn test_get_auction_bids_ledger_sequence_recorded() {
+    // Verify the `ledger` field in BidRecord is populated with the ledger
+    // sequence at the time the bid was placed.
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let seq_before = env.ledger().sequence();
+    client.place_bid(&buyer, &auction_id, &1_500_000_i128);
+
+    let history = client.get_auction_bids(&auction_id);
+    assert_eq!(history.len(), 1);
+
+    let record = history.get(0).unwrap();
+    // The ledger sequence recorded must be >= the sequence before the bid call.
+    assert!(
+        record.ledger >= seq_before,
+        "bid record must carry a valid ledger sequence"
+    );
+}
+
+// =============================================================================
+// Minimum auction duration validation — InvalidAuctionDuration (#31)
+// =============================================================================
+//
+// Acceptance criteria:
+//   1. Duration < MIN_AUCTION_DURATION (3600 s) reverts with InvalidAuctionDuration.
+//   2. Duration == 0 reverts.
+//   3. Duration == MIN_AUCTION_DURATION - 1 reverts.
+//   4. Duration == MIN_AUCTION_DURATION succeeds (boundary).
+//   5. Duration > MIN_AUCTION_DURATION succeeds.
+// =============================================================================
+
+#[test]
+#[should_panic(expected = "Error(Contract, #31)")]
+fn test_create_auction_zero_duration_reverts() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // Duration = 0 is below MIN_AUCTION_DURATION; must revert.
+    client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &0u64, // zero duration
+        &valid_recipients(&env, &artist),
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #31)")]
+fn test_create_auction_one_second_duration_reverts() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // Duration of 1 second is far below the 1-hour minimum.
+    client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &1u64, // 1 second
+        &valid_recipients(&env, &artist),
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #31)")]
+fn test_create_auction_one_below_min_duration_reverts() {
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    // 3599 seconds = MIN_AUCTION_DURATION - 1; must be rejected.
+    client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3599u64, // one second below the 1-hour minimum
+        &valid_recipients(&env, &artist),
+    );
+}
+
+#[test]
+fn test_create_auction_exact_min_duration_succeeds() {
+    // Duration == MIN_AUCTION_DURATION (3600 s) must be accepted (boundary value).
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64, // exactly MIN_AUCTION_DURATION
+        &valid_recipients(&env, &artist),
+    );
+
+    assert_eq!(auction_id, 1u64, "auction must be created at exact minimum duration");
+
+    let auction = client.get_auction(&auction_id);
+    // end_time must be at least 3600 seconds from the creation timestamp.
+    assert!(
+        auction.end_time >= env.ledger().timestamp() + 3600,
+        "end_time must reflect the full minimum duration"
+    );
+}
+
+#[test]
+fn test_create_auction_above_min_duration_succeeds() {
+    // Duration well above the minimum (24 hours) must be accepted.
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let duration = 86_400u64; // 24 hours
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &duration,
+        &valid_recipients(&env, &artist),
+    );
+
+    assert_eq!(auction_id, 1u64);
+
+    let auction = client.get_auction(&auction_id);
+    assert!(
+        auction.end_time >= env.ledger().timestamp() + duration,
+        "end_time must reflect the requested duration"
+    );
+}
+
+#[test]
+fn test_create_auction_min_duration_end_time_is_future() {
+    // Verify that even at the minimum duration the end_time is strictly in the
+    // future relative to the ledger timestamp at creation.
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let ts_before = env.ledger().timestamp();
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let auction = client.get_auction(&auction_id);
+    assert!(
+        auction.end_time > ts_before,
+        "end_time must be strictly greater than the ledger timestamp at creation"
+    );
+}
+
+// =============================================================================
+// ISSUE-028 — Auction escrow-conservation invariant tests
+// =============================================================================
+//
+// Acceptance criteria:
+//   1. After every bid, contract token balance == current highest bid
+//      (net of the pre-funded contract balance from setup()).
+//   2. After finalize with a winner, the auction's escrow contribution is
+//      fully drained and creator/winner balances reconcile.
+//   3. After finalize with no bids, escrow is unchanged (nothing was deposited).
+//   4. After cancel (no bids), escrow is unchanged.
+//   5. Multi-bidder sequences preserve the invariant at every step.
+// =============================================================================
+
+/// Snapshot baseline balances needed for escrow-conservation assertions.
+struct EscrowSnapshot {
+    /// Contract balance before any bids on this auction.
+    contract_base: i128,
+}
+
+impl EscrowSnapshot {
+    fn new(env: &Env, token_id: &Address, contract_id: &Address) -> Self {
+        let token = soroban_sdk::token::TokenClient::new(env, token_id);
+        Self {
+            contract_base: token.balance(contract_id),
+        }
+    }
+
+    /// Assert that the contract holds exactly `expected_escrow` above its
+    /// baseline, i.e. contract_balance == contract_base + expected_escrow.
+    fn assert_escrow(&self, env: &Env, token_id: &Address, contract_id: &Address, expected_escrow: i128, msg: &str) {
+        let token = soroban_sdk::token::TokenClient::new(env, token_id);
+        let current = token.balance(contract_id);
+        assert_eq!(
+            current - self.contract_base,
+            expected_escrow,
+            "{}",
+            msg,
+        );
+    }
+}
+#[test]
+fn test_escrow_equals_highest_bid_after_each_bid() {
+    // Multi-bidder sequence: 5 bidders each outbid the previous one.
+    // After every bid, contract escrow must equal the current highest bid.
+    let (env, client, artist, _buyer, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
+    let base_balance = 100_000_000_000_i128;
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let snap = EscrowSnapshot::new(&env, &token_id, &contract_id);
+
+    // Generate 5 bidders and place escalating bids.
+    let bid_amounts: [i128; 5] = [1_000_000, 2_000_000, 3_000_000, 4_000_000, 5_000_000];
+    let mut bidders = soroban_sdk::Vec::new(&env);
+    for _ in 0..5 {
+        let b = Address::generate(&env);
+        sac.mint(&b, &base_balance);
+        bidders.push_back(b);
+    }
+
+    for (i, &amount) in bid_amounts.iter().enumerate() {
+        let bidder = bidders.get(i as u32).unwrap();
+        client.place_bid(&bidder, &auction_id, &amount);
+
+        // Invariant: escrow == highest bid after this step.
+        snap.assert_escrow(
+            &env, &token_id, &contract_id,
+            amount,
+            "escrow must equal highest bid after each bid step",
+        );
+
+        // Invariant: outbid bidders are fully refunded.
+        if i > 0 {
+            let prev_bidder = bidders.get(i as u32 - 1).unwrap();
+            let token = soroban_sdk::token::TokenClient::new(&env, &token_id);
+            assert_eq!(
+                token.balance(&prev_bidder),
+                base_balance,
+                "bidder {} must be fully refunded after being outbid",
+                i,
+            );
+        }
+    }
+}
+
+#[test]
+fn test_escrow_zero_after_finalize_with_winner() {
+    // After finalization the contract must hold zero escrow for this auction
+    // and creator + winner balances must reconcile.
+    let (env, client, artist, buyer, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let bid_amount = 3_000_000_i128;
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let snap = EscrowSnapshot::new(&env, &token_id, &contract_id);
+    let token = soroban_sdk::token::TokenClient::new(&env, &token_id);
+
+    let artist_before = token.balance(&artist);
+    let buyer_before  = token.balance(&buyer);
+
+    client.place_bid(&buyer, &auction_id, &bid_amount);
+
+    // Invariant before finalize: escrow == bid.
+    snap.assert_escrow(&env, &token_id, &contract_id, bid_amount,
+        "escrow must equal the winning bid before finalization");
+
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+    client.finalize_auction(&buyer, &auction_id);
+
+    // Post-finalize: contract escrow contribution from this auction is zero.
+    snap.assert_escrow(&env, &token_id, &contract_id, 0,
+        "contract must hold zero escrow after finalization");
+
+    // Balance reconciliation: no protocol fee set, so creator receives full bid.
+    let artist_after = token.balance(&artist);
+    let buyer_after  = token.balance(&buyer);
+
+    assert_eq!(
+        artist_after - artist_before,
+        bid_amount,
+        "creator must receive the full winning bid (no fee configured)",
+    );
+    assert_eq!(
+        buyer_before - buyer_after,
+        bid_amount,
+        "winner's net outflow must equal the winning bid",
+    );
+}
+
+#[test]
+fn test_escrow_zero_after_finalize_with_winner_and_fee() {
+    // Repeat with a 5 % protocol fee to verify reconciliation still holds.
+    let (env, client, artist, buyer, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let treasury = Address::generate(&env);
+    client.set_treasury(&artist, &treasury);
+    client.set_protocol_fee(&artist, &500u32); // 5 %
+
+    let bid_amount = 10_000_000_i128;
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let snap = EscrowSnapshot::new(&env, &token_id, &contract_id);
+    let token = soroban_sdk::token::TokenClient::new(&env, &token_id);
+
+    let artist_before   = token.balance(&artist);
+    let buyer_before    = token.balance(&buyer);
+    let treasury_before = token.balance(&treasury);
+
+    client.place_bid(&buyer, &auction_id, &bid_amount);
+    snap.assert_escrow(&env, &token_id, &contract_id, bid_amount,
+        "escrow must equal bid before finalize");
+
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+    client.finalize_auction(&buyer, &auction_id);
+
+    snap.assert_escrow(&env, &token_id, &contract_id, 0,
+        "contract escrow must be zero after finalization");
+
+    let expected_fee    = bid_amount * 500 / 10_000; // 500_000
+    let expected_seller = bid_amount - expected_fee;  // 9_500_000
+
+    assert_eq!(token.balance(&artist)   - artist_before,   expected_seller);
+    assert_eq!(token.balance(&treasury) - treasury_before, expected_fee);
+    assert_eq!(buyer_before - token.balance(&buyer),       bid_amount);
+}
+
+#[test]
+fn test_escrow_zero_after_finalize_no_bids() {
+    // When no bids were placed the contract escrow must remain unchanged
+    // (nothing deposited, nothing to drain).
+    let (env, client, artist, _, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let snap = EscrowSnapshot::new(&env, &token_id, &contract_id);
+
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+    client.finalize_auction(&artist, &auction_id);
+
+    // No bid was ever escrowed — delta must be zero.
+    snap.assert_escrow(&env, &token_id, &contract_id, 0,
+        "no escrow change when no bids were placed");
+
+    let auction = client.get_auction(&auction_id);
+    assert_eq!(auction.status, crate::types::AuctionStatus::Cancelled);
+}
+
+#[test]
+fn test_escrow_zero_after_cancel_no_bids() {
+    // cancel_auction with no bids also must not disturb escrow.
+    let (env, client, artist, _, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let snap = EscrowSnapshot::new(&env, &token_id, &contract_id);
+    client.cancel_auction(&artist, &auction_id);
+
+    snap.assert_escrow(&env, &token_id, &contract_id, 0,
+        "cancel with no bids must leave escrow unchanged");
+}
+
+#[test]
+fn test_escrow_invariant_multi_bidder_sequence_with_outbids() {
+    // Simulate a realistic auction: 3 bidders raise each other in turn.
+    // Assert escrow after every bid and full reconciliation after finalize.
+    let (env, client, artist, _buyer, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
+    let base_balance = 100_000_000_000_i128;
+
+    let bidder_a = Address::generate(&env);
+    let bidder_b = Address::generate(&env);
+    let bidder_c = Address::generate(&env);
+    sac.mint(&bidder_a, &base_balance);
+    sac.mint(&bidder_b, &base_balance);
+    sac.mint(&bidder_c, &base_balance);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let snap  = EscrowSnapshot::new(&env, &token_id, &contract_id);
+    let token = soroban_sdk::token::TokenClient::new(&env, &token_id);
+
+    // Round 1 — A bids 1 000 000.
+    client.place_bid(&bidder_a, &auction_id, &1_000_000_i128);
+    snap.assert_escrow(&env, &token_id, &contract_id, 1_000_000,
+        "after round 1: escrow == 1_000_000");
+
+    // Round 2 — B outbids with 2 000 000; A is refunded.
+    client.place_bid(&bidder_b, &auction_id, &2_000_000_i128);
+    snap.assert_escrow(&env, &token_id, &contract_id, 2_000_000,
+        "after round 2: escrow == 2_000_000");
+    assert_eq!(token.balance(&bidder_a), base_balance,
+        "bidder_a fully refunded after round 2");
+
+    // Round 3 — C outbids with 3 000 000; B is refunded.
+    client.place_bid(&bidder_c, &auction_id, &3_000_000_i128);
+    snap.assert_escrow(&env, &token_id, &contract_id, 3_000_000,
+        "after round 3: escrow == 3_000_000");
+    assert_eq!(token.balance(&bidder_b), base_balance,
+        "bidder_b fully refunded after round 3");
+
+    // Round 4 — A re-enters at 4 000 000; C is refunded.
+    client.place_bid(&bidder_a, &auction_id, &4_000_000_i128);
+    snap.assert_escrow(&env, &token_id, &contract_id, 4_000_000,
+        "after round 4: escrow == 4_000_000");
+    assert_eq!(token.balance(&bidder_c), base_balance,
+        "bidder_c fully refunded after round 4");
+
+    // Finalize.
+    let artist_before = token.balance(&artist);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+    client.finalize_auction(&bidder_a, &auction_id);
+
+    // Post-finalize escrow is zero.
+    snap.assert_escrow(&env, &token_id, &contract_id, 0,
+        "escrow must be zero after finalization");
+
+    // Balances reconcile (no fee configured).
+    assert_eq!(token.balance(&artist) - artist_before, 4_000_000_i128,
+        "creator receives the winning bid");
+    assert_eq!(base_balance - token.balance(&bidder_a), 4_000_000_i128,
+        "winner's net outflow equals the winning bid");
+    // Other bidders fully refunded throughout.
+    assert_eq!(token.balance(&bidder_b), base_balance);
+    assert_eq!(token.balance(&bidder_c), base_balance);
+}
+
+#[test]
+fn test_escrow_invariant_same_bidder_raises_own_bid() {
+    // A single bidder may raise their own bid. Each new bid refunds the
+    // previous escrow, so the net held is always the latest bid amount.
+    let (env, client, artist, buyer, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let snap  = EscrowSnapshot::new(&env, &token_id, &contract_id);
+    let token = soroban_sdk::token::TokenClient::new(&env, &token_id);
+    let base  = token.balance(&buyer);
+
+    client.place_bid(&buyer, &auction_id, &1_000_000_i128);
+    snap.assert_escrow(&env, &token_id, &contract_id, 1_000_000,
+        "escrow after first self-raise bid");
+
+    client.place_bid(&buyer, &auction_id, &2_000_000_i128);
+    snap.assert_escrow(&env, &token_id, &contract_id, 2_000_000,
+        "escrow after second self-raise bid");
+    // Net outflow from buyer is the latest bid amount (previous escrow refunded).
+    assert_eq!(base - token.balance(&buyer), 2_000_000_i128,
+        "buyer's net outflow is the current highest bid");
+
+    client.place_bid(&buyer, &auction_id, &5_000_000_i128);
+    snap.assert_escrow(&env, &token_id, &contract_id, 5_000_000,
+        "escrow after third self-raise bid");
+    assert_eq!(base - token.balance(&buyer), 5_000_000_i128);
+
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+    client.finalize_auction(&buyer, &auction_id);
+
+    snap.assert_escrow(&env, &token_id, &contract_id, 0,
+        "escrow zero after finalize");
+}
+
+// =============================================================================
+// ISSUE-028 (b) — Self-bid (shill bidding) prevention
+// =============================================================================
+//
+// Acceptance criteria:
+//   1. The auction creator cannot place a bid on their own auction.
+//   2. The error raised is SelfBidNotAllowed (#32).
+//   3. A distinct bidder (not the creator) can still bid normally.
+//   4. The check fires even if the creator would be the first bidder.
+//   5. The check fires even if the creator tries to outbid an existing bid.
+// =============================================================================
+
+#[test]
+#[should_panic(expected = "Error(Contract, #32)")]
+fn test_creator_cannot_bid_on_own_auction() {
+    // The simplest case: creator attempts the first bid.
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    // Creator tries to bid on their own auction — must revert with #32.
+    client.place_bid(&artist, &auction_id, &1_500_000_i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #32)")]
+fn test_creator_cannot_outbid_existing_bid() {
+    // A legitimate bidder bids first; the creator then tries to outbid — still blocked.
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    // Legitimate first bid from buyer.
+    client.place_bid(&buyer, &auction_id, &1_000_000_i128);
+
+    // Creator attempts to outbid — must still revert with SelfBidNotAllowed.
+    client.place_bid(&artist, &auction_id, &2_000_000_i128);
+}
+
+#[test]
+fn test_non_creator_can_bid_normally() {
+    // Verify the guard does not affect legitimate bidders.
+    let (env, client, artist, buyer, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    // Non-creator bid must succeed.
+    client.place_bid(&buyer, &auction_id, &1_500_000_i128);
+
+    let auction = client.get_auction(&auction_id);
+    assert_eq!(auction.highest_bid, 1_500_000_i128);
+    assert_eq!(auction.highest_bidder, Some(buyer));
+}
+
+#[test]
+fn test_self_bid_blocked_uses_dedicated_error_code() {
+    // Verify the error code is exactly 32 (SelfBidNotAllowed), not a generic
+    // Unauthorized (#5) — important for frontend error handling.
+    let (env, client, artist, _, token_id, _contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    let result = client.try_place_bid(&artist, &auction_id, &1_500_000_i128);
+    assert!(result.is_err(), "self-bid must return an error");
+
+    let err = result.unwrap_err().unwrap();
+    assert_eq!(
+        err,
+        crate::types::MarketplaceError::SelfBidNotAllowed,
+        "error must be SelfBidNotAllowed (#32), not a generic error",
+    );
+}
+
+#[test]
+fn test_self_bid_blocked_does_not_mutate_state() {
+    // A rejected self-bid must leave the auction completely unchanged.
+    let (env, client, artist, buyer, token_id, contract_id, collection_id) = setup();
+    client.set_admin(&artist);
+    client.add_token_to_whitelist(&token_id);
+
+    let auction_id = client.create_auction(
+        &artist,
+        &token_id,
+        &collection_id,
+        &1u64,
+        &1_000_000_i128,
+        &3600u64,
+        &valid_recipients(&env, &artist),
+    );
+
+    // Place a legitimate bid first so there is existing state to check.
+    client.place_bid(&buyer, &auction_id, &1_000_000_i128);
+
+    let token = soroban_sdk::token::TokenClient::new(&env, &token_id);
+    let artist_balance_before   = token.balance(&artist);
+    let contract_balance_before = token.balance(&contract_id);
+    let auction_before = client.get_auction(&auction_id);
+
+    // Creator tries to self-bid — must fail.
+    let _ = client.try_place_bid(&artist, &auction_id, &2_000_000_i128);
+
+    // Auction state is unchanged.
+    let auction_after = client.get_auction(&auction_id);
+    assert_eq!(auction_after.highest_bid,    auction_before.highest_bid);
+    assert_eq!(auction_after.highest_bidder, auction_before.highest_bidder);
+
+    // No tokens moved.
+    assert_eq!(token.balance(&artist),      artist_balance_before);
+    assert_eq!(token.balance(&contract_id), contract_balance_before);
 }

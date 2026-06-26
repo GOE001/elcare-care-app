@@ -1,5 +1,5 @@
 // storage.rs
-use crate::types::{Auction, Listing, Offer};
+use crate::types::{Auction, BidRecord, Listing, Offer};
 use soroban_sdk::{contracttype, Address, Env, Vec};
 
 #[contracttype]
@@ -31,6 +31,8 @@ pub enum DataKey {
     /// Global extension trigger threshold in seconds (anti-sniping: fires when
     /// `end_time - now < threshold` at bid time).
     AuctionExtensionTrigger,
+    /// Bounded bid history for a specific auction (capped to BID_HISTORY_CAP entries).
+    AuctionBids(u64),
 }
 
 pub const LEDGER_TTL_BUMP: u32 = 432_000;
@@ -455,7 +457,50 @@ pub fn clear_pending_admin_storage(env: &Env) {
     env.storage().persistent().remove(&DataKey::PendingAdmin);
 }
 
-// ── Pause/Unpause Mechanism ──────────────────────────────────
+// ── Auction bid history ──────────────────────────────────────
+
+/// Append `record` to the bounded bid history for `auction_id`.
+///
+/// The history vector is capped to `cap` entries.  When the vector is already
+/// at capacity the oldest entry (index 0) is evicted before the new one is
+/// pushed, so the vector always holds the most recent <= N bids in
+/// chronological (oldest-to-newest) order.
+pub fn append_bid_record(env: &Env, auction_id: u64, record: &BidRecord, cap: u32) {
+    let key = DataKey::AuctionBids(auction_id);
+    let mut history = env
+        .storage()
+        .persistent()
+        .get::<DataKey, soroban_sdk::Vec<BidRecord>>(&key)
+        .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+
+    // Evict the oldest entry when the history is already full.
+    if history.len() >= cap {
+        let mut trimmed = soroban_sdk::Vec::new(env);
+        for i in 1..history.len() {
+            trimmed.push_back(history.get(i).unwrap());
+        }
+        history = trimmed;
+    }
+
+    history.push_back(record.clone());
+    env.storage().persistent().set(&key, &history);
+    bump_entry_ttl(env, &key);
+}
+
+/// Load the bounded bid history for `auction_id`.  Returns an empty vector if
+/// no bids have been placed yet or the key has been evicted.
+pub fn load_auction_bids(env: &Env, auction_id: u64) -> soroban_sdk::Vec<BidRecord> {
+    let key = DataKey::AuctionBids(auction_id);
+    let value = env
+        .storage()
+        .persistent()
+        .get::<DataKey, soroban_sdk::Vec<BidRecord>>(&key)
+        .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+    if !value.is_empty() {
+        bump_entry_ttl(env, &key);
+    }
+    value
+}
 
 pub fn set_paused(env: &Env, paused: bool) {
     env.storage().persistent().set(&DataKey::IsPaused, &paused);
@@ -467,4 +512,60 @@ pub fn is_paused(env: &Env) -> bool {
         .persistent()
         .get::<DataKey, bool>(&DataKey::IsPaused)
         .unwrap_or(false)
+}
+
+// ── Price bounds ─────────────────────────────────────────────
+
+/// Persist the global minimum price bound (in payment-token stroops).
+pub fn set_min_price_storage(env: &Env, min: i128) {
+    env.storage().persistent().set(&DataKey::MinPrice, &min);
+    bump_entry_ttl(env, &DataKey::MinPrice);
+}
+
+/// Retrieve the global minimum price bound, or `None` if not set.
+pub fn get_min_price_storage(env: &Env) -> Option<i128> {
+    let value = env.storage().persistent().get(&DataKey::MinPrice);
+    if value.is_some() {
+        bump_entry_ttl(env, &DataKey::MinPrice);
+    }
+    value
+}
+
+/// Persist the global maximum price bound (in payment-token stroops).
+pub fn set_max_price_storage(env: &Env, max: i128) {
+    env.storage().persistent().set(&DataKey::MaxPrice, &max);
+    bump_entry_ttl(env, &DataKey::MaxPrice);
+}
+
+/// Retrieve the global maximum price bound, or `None` if not set.
+pub fn get_max_price_storage(env: &Env) -> Option<i128> {
+    let value = env.storage().persistent().get(&DataKey::MaxPrice);
+    if value.is_some() {
+        bump_entry_ttl(env, &DataKey::MaxPrice);
+    }
+    value
+}
+
+// ── Migration marker ─────────────────────────────────────────
+
+/// Record that the migration for `version` has been executed.
+/// After this call, `is_migration_done` returns `true` for the same version.
+pub fn set_migration_done(env: &Env, version: &soroban_sdk::String) {
+    let key = DataKey::MigrationDone(version.clone());
+    env.storage().persistent().set(&key, &true);
+    bump_entry_ttl(env, &key);
+}
+
+/// Returns `true` if the migration for `version` has already been applied.
+pub fn is_migration_done(env: &Env, version: &soroban_sdk::String) -> bool {
+    let key = DataKey::MigrationDone(version.clone());
+    let done = env
+        .storage()
+        .persistent()
+        .get::<_, bool>(&key)
+        .unwrap_or(false);
+    if done {
+        bump_entry_ttl(env, &key);
+    }
+    done
 }
